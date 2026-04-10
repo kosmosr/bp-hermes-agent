@@ -2575,6 +2575,13 @@ class GatewayRunner:
                 return None
             return QQAdapter(config)
 
+        elif platform == Platform.DESKTOP:
+            from gateway.platforms.desktop import DesktopAdapter, check_desktop_requirements
+            if not check_desktop_requirements():
+                logger.warning("Desktop: aiohttp not installed")
+                return None
+            return DesktopAdapter(config)
+
         return None
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -2593,7 +2600,8 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        # Desktop connections are authenticated via loopback + Bearer token.
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.DESKTOP):
             return True
 
         user_id = source.user_id
