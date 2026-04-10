@@ -18,7 +18,7 @@ import os
 import secrets
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
@@ -87,7 +87,7 @@ class _EnvelopeRingBuffer:
 
     def __init__(self, capacity: int = 500):
         self._capacity = capacity
-        self._buf: list[tuple[int, dict]] = []  # (seq, envelope)
+        self._buf: deque[tuple[int, dict]] = deque(maxlen=capacity)
         self._seq = 0
 
     @property
@@ -97,8 +97,6 @@ class _EnvelopeRingBuffer:
     def append(self, envelope: dict) -> int:
         self._seq += 1
         self._buf.append((self._seq, envelope))
-        if len(self._buf) > self._capacity:
-            self._buf.pop(0)
         return self._seq
 
     def since(self, seq: int) -> tuple[list[dict], bool]:
@@ -238,8 +236,12 @@ class DesktopAdapter(BasePlatformAdapter):
             return self._token_file.read_text().strip()
         self._token_file.parent.mkdir(parents=True, exist_ok=True)
         token = secrets.token_hex(32)
-        self._token_file.write_text(token)
-        self._token_file.chmod(0o600)
+        # Atomic create with restricted permissions (avoids world-readable window)
+        fd = os.open(str(self._token_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, token.encode())
+        finally:
+            os.close(fd)
         return token
 
     @staticmethod
