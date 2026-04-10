@@ -67,6 +67,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    DESKTOP = "desktop"
 
 
 @dataclass
@@ -989,6 +990,28 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # Desktop platform
+    desktop_enabled = os.getenv("DESKTOP_ENABLED", "").lower() in ("true", "1", "yes")
+    desktop_port = os.getenv("DESKTOP_PORT")
+    desktop_host = os.getenv("DESKTOP_HOST")
+    desktop_max_conn = os.getenv("DESKTOP_MAX_CONNECTIONS")
+    if desktop_enabled:
+        if Platform.DESKTOP not in config.platforms:
+            config.platforms[Platform.DESKTOP] = PlatformConfig()
+        config.platforms[Platform.DESKTOP].enabled = True
+        if desktop_port:
+            try:
+                config.platforms[Platform.DESKTOP].extra["port"] = int(desktop_port)
+            except ValueError:
+                pass
+        if desktop_host:
+            config.platforms[Platform.DESKTOP].extra["host"] = desktop_host
+        if desktop_max_conn:
+            try:
+                config.platforms[Platform.DESKTOP].extra["max_connections"] = int(desktop_max_conn)
+            except ValueError:
+                pass
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")
