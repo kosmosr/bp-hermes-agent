@@ -290,6 +290,12 @@ class DesktopAdapter(BasePlatformAdapter):
         ws = web.WebSocketResponse(max_msg_size=1_048_576)  # 1 MB
         await ws.prepare(request)
 
+        # Protocol version check — client should send v=1
+        client_version = request.query.get("v", "1")
+        if client_version != "1":
+            await ws.close(code=4403, message=b"Protocol version mismatch")
+            return ws
+
         conn = _Connection(
             id=uuid.uuid4().hex,
             ws=ws,
