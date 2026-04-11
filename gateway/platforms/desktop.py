@@ -194,7 +194,14 @@ class DesktopAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a text message to a session (broadcast to subscribers)."""
+        """Send a text message to a session (broadcast to subscribers).
+
+        When called during an active turn (by hermes core after agent completes),
+        the content was already streamed via deltas — skip to avoid duplication.
+        Only broadcast when no active turn exists (true system notifications).
+        """
+        if chat_id in self._active_turns:
+            return SendResult(success=True, message_id=f"msg-{uuid.uuid4().hex[:10]}")
         await self._broadcast_to_session(chat_id, {
             "kind": "message.delta",
             "turn_id": None,
@@ -599,13 +606,8 @@ class DesktopAdapter(BasePlatformAdapter):
                         task_id=session_id,
                     ),
                 )
-                # Send final response if not already streamed via deltas
-                final_text = (result or {}).get("final_response") or ""
-                if final_text:
-                    await self._broadcast_to_session(session_id, {
-                        "kind": "message.delta", "turn_id": turn_id,
-                        "text": final_text,
-                    })
+                # final_response is skipped — content was already streamed
+                # via _on_delta callback during agent execution.
                 usage = {
                     "prompt_tokens": getattr(active.agent, "session_prompt_tokens", 0) or 0,
                     "completion_tokens": getattr(active.agent, "session_completion_tokens", 0) or 0,
