@@ -570,11 +570,18 @@ class DesktopAdapter(BasePlatformAdapter):
                 result = await loop.run_in_executor(
                     None,
                     lambda: active.agent.run_conversation(
-                        message=user_message,
+                        user_message=user_message,
                         conversation_history=None,
                         task_id=session_id,
                     ),
                 )
+                # Send final response if not already streamed via deltas
+                final_text = (result or {}).get("final_response") or ""
+                if final_text:
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "message.delta", "turn_id": turn_id,
+                        "text": final_text,
+                    })
                 usage = {
                     "prompt_tokens": getattr(active.agent, "session_prompt_tokens", 0) or 0,
                     "completion_tokens": getattr(active.agent, "session_completion_tokens", 0) or 0,
