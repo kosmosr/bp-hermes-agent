@@ -558,17 +558,31 @@ class DesktopAdapter(BasePlatformAdapter):
                        "error": kw.get("is_error", False),
                        "output_preview": kw.get("output_preview")}
             elif event_type == "reasoning.available":
-                env = {"kind": "reasoning.delta", "turn_id": turn_id, "text": preview or ""}
+                # SKIP — upstream sends assistant_message.content (the response
+                # text) as "reasoning.available", which is wrong for our use case.
+                # Real reasoning arrives via reasoning_callback below.
+                return
             else:
                 return
             asyncio.run_coroutine_threadsafe(
                 self._broadcast_to_session(session_id, env), loop
             )
 
+        def _on_reasoning(text):
+            """Receive streaming reasoning/thinking tokens from the model."""
+            if not text:
+                return
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast_to_session(session_id, {
+                    "kind": "reasoning.delta", "turn_id": turn_id, "text": text,
+                }), loop
+            )
+
         agent = self._create_agent_for_turn(
             session_id=session_id,
             stream_delta_callback=_on_delta,
             tool_progress_callback=_on_tool_progress,
+            reasoning_callback=_on_reasoning,
         )
         active.agent = agent
 
@@ -590,6 +604,7 @@ class DesktopAdapter(BasePlatformAdapter):
 
     def _create_agent_for_turn(self, session_id, stream_delta_callback=None,
                                 tool_progress_callback=None,
+                                reasoning_callback=None,
                                 ephemeral_system_prompt=None):
         """Create an AIAgent instance — mirrors api_server.py:404 pattern."""
         from run_agent import AIAgent
@@ -616,6 +631,7 @@ class DesktopAdapter(BasePlatformAdapter):
             platform="desktop",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
