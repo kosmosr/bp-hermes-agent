@@ -984,6 +984,14 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
     if custom_mode == "codex_responses":
         real_client = OpenAI(api_key=custom_key, base_url=custom_base)
         return CodexAuxiliaryClient(real_client, model), model
+    if custom_mode == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+            real_client = build_anthropic_client(custom_key, custom_base)
+            return AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base), model
+        except ImportError:
+            logger.warning("anthropic_messages mode requires the anthropic package")
+            return None, None
     return OpenAI(api_key=custom_key, base_url=custom_base), model
 
 

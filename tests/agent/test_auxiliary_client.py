@@ -653,6 +653,21 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
 
 
+    def test_custom_endpoint_uses_anthropic_wrapper_when_runtime_requests_anthropic_messages(self):
+        mock_anthropic_client = MagicMock()
+        with patch("agent.auxiliary_client._resolve_custom_runtime",
+                   return_value=("https://custom.example.com", "sk-ant-test", "anthropic_messages")), \
+             patch("agent.auxiliary_client._read_main_model", return_value="claude-opus-4.6"), \
+             patch("agent.anthropic_adapter.build_anthropic_client",
+                   return_value=mock_anthropic_client) as mock_build:
+            client, model = get_text_auxiliary_client()
+
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+        assert isinstance(client, AnthropicAuxiliaryClient)
+        assert model == "claude-opus-4.6"
+        mock_build.assert_called_once_with("sk-ant-test", "https://custom.example.com")
+
+
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
 
