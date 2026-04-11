@@ -147,6 +147,8 @@ class DesktopAdapter(BasePlatformAdapter):
         )
         # request_id → session_key for pending approvals
         self._pending_approvals: Dict[str, str] = {}
+        # session_id → {title, created_at} — lightweight in-memory registry
+        self._known_sessions: Dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter abstract methods
@@ -309,7 +311,10 @@ class DesktopAdapter(BasePlatformAdapter):
                 "welcome",
                 capabilities=["approval", "reasoning", "tool_events", "interrupt", "markdown"],
                 server={"version": VERSION, "hermes_version": "0.8.x"},
-                sessions=[],
+                sessions=[
+                    {"session_id": sid, "title": info["title"], "created_at": info.get("created_at")}
+                    for sid, info in self._known_sessions.items()
+                ],
             )
 
             # Message loop
@@ -382,15 +387,22 @@ class DesktopAdapter(BasePlatformAdapter):
         await conn.send("pong")
 
     async def _handle_session_list(self, conn: _Connection, msg: dict) -> None:
-        await conn.send("session.list.ok", sessions=[])
+        await conn.send("session.list.ok", sessions=[
+            {"session_id": sid, "title": info["title"], "created_at": info.get("created_at")}
+            for sid, info in self._known_sessions.items()
+        ])
 
     async def _handle_session_new(self, conn: _Connection, msg: dict) -> None:
         session_id = f"sess-{uuid.uuid4().hex[:12]}"
         title = msg.get("title", "New Chat")
+        created_at = time.time()
+        self._known_sessions[session_id] = {
+            "title": title, "created_at": created_at,
+        }
         await conn.send("session.new.ok", session={
             "session_id": session_id,
             "title": title,
-            "created_at": time.time(),
+            "created_at": created_at,
         })
 
     async def _handle_session_subscribe(self, conn: _Connection, msg: dict) -> None:
