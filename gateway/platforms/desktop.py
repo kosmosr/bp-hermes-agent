@@ -510,6 +510,12 @@ class DesktopAdapter(BasePlatformAdapter):
         )
         active.agent = agent
 
+        # Store user message in ring buffer so snapshot replay includes it
+        await self._broadcast_to_session(session_id, {
+            "kind": "user.message", "session_id": session_id,
+            "turn_id": turn_id, "content": content,
+        })
+
         await self._broadcast_to_session(session_id, {
             "kind": "turn.started", "session_id": session_id, "turn_id": turn_id,
         })
