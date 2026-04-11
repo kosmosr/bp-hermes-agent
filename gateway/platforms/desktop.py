@@ -149,6 +149,8 @@ class DesktopAdapter(BasePlatformAdapter):
         self._pending_approvals: Dict[str, str] = {}
         # session_id → {title, created_at} — lightweight in-memory registry
         self._known_sessions: Dict[str, dict] = {}
+        # session_id -> list of message dicts for agent conversation_history
+        self._session_histories: Dict[str, list] = {}
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter abstract methods
@@ -412,6 +414,7 @@ class DesktopAdapter(BasePlatformAdapter):
         self._known_sessions[session_id] = {
             "title": title, "created_at": created_at,
         }
+        self._session_histories.pop(session_id, None)
         await conn.send("session.new.ok", session={
             "session_id": session_id,
             "title": title,
@@ -598,14 +601,18 @@ class DesktopAdapter(BasePlatformAdapter):
 
         async with self._turn_semaphore:
             try:
+                history = self._session_histories.get(session_id)
                 result = await loop.run_in_executor(
                     None,
                     lambda: active.agent.run_conversation(
                         user_message=user_message,
-                        conversation_history=None,
+                        conversation_history=history,
                         task_id=session_id,
                     ),
                 )
+                # Capture full message history for next turn
+                if result and isinstance(result, dict) and "messages" in result:
+                    self._session_histories[session_id] = result["messages"]
                 # final_response is skipped — content was already streamed
                 # via _on_delta callback during agent execution.
                 usage = {
