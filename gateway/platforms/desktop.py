@@ -321,6 +321,43 @@ class DesktopAdapter(BasePlatformAdapter):
         )
 
         try:
+            # Build dynamic data for welcome envelope
+            welcome_commands = []
+            welcome_toolsets = []
+            welcome_skills = []
+            try:
+                from hermes_cli.commands import COMMAND_REGISTRY
+                welcome_commands = [
+                    {"name": c.name, "description": c.description,
+                     "category": c.category, "args_hint": c.args_hint or None}
+                    for c in COMMAND_REGISTRY
+                    if not c.cli_only or c.gateway_config_gate
+                ]
+            except Exception:
+                logger.debug("[desktop] could not load command registry for welcome")
+
+            try:
+                from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_platform_tools
+                from gateway.run import _load_gateway_config
+                user_config = _load_gateway_config()
+                enabled_set = set(_get_platform_tools(user_config, "desktop"))
+                welcome_toolsets = [
+                    {"id": ts_key, "label": ts_label, "enabled": ts_key in enabled_set}
+                    for ts_key, ts_label, _desc in CONFIGURABLE_TOOLSETS
+                ]
+            except Exception:
+                logger.debug("[desktop] could not load toolsets for welcome")
+
+            try:
+                from agent.skill_commands import get_skill_commands
+                welcome_skills = [
+                    {"slug": slug.lstrip("/"), "name": info["name"],
+                     "description": info.get("description", "")}
+                    for slug, info in get_skill_commands().items()
+                ]
+            except Exception:
+                logger.debug("[desktop] could not load skills for welcome")
+
             # Send welcome
             await conn.send(
                 "welcome",
@@ -330,6 +367,10 @@ class DesktopAdapter(BasePlatformAdapter):
                     {"session_id": sid, "title": info["title"], "created_at": info.get("created_at")}
                     for sid, info in self._known_sessions.items()
                 ],
+                commands=welcome_commands,
+                toolsets=welcome_toolsets,
+                skills=welcome_skills,
+                working_dir=os.environ.get("TERMINAL_CWD", ""),
             )
 
             # Message loop
@@ -494,14 +535,25 @@ class DesktopAdapter(BasePlatformAdapter):
                 }), loop
             )
 
-        def _on_tool_progress(event_type, tool_name=None, preview=None, **kw):
+        # Auto-generate call_id for tool events since upstream AIAgent
+        # doesn't provide one. Tracks current tool_name → call_id mapping
+        # so tool.completed can reference the same id as tool.started.
+        _tool_call_seq = 0
+        _active_tool_calls: dict[str, str] = {}  # tool_name → call_id
+
+        def _on_tool_progress(event_type, tool_name=None, preview=None, args=None, **kw):
+            nonlocal _tool_call_seq
             if event_type == "tool.started":
+                _tool_call_seq += 1
+                call_id = kw.get("call_id") or f"call-{turn_id[-8:]}-{_tool_call_seq}"
+                _active_tool_calls[tool_name or ""] = call_id
                 env = {"kind": "tool.started", "turn_id": turn_id,
-                       "call_id": kw.get("call_id", ""), "tool": tool_name,
-                       "preview": preview, "args": kw.get("args")}
+                       "call_id": call_id, "tool": tool_name,
+                       "preview": preview, "args": args}
             elif event_type == "tool.completed":
+                call_id = kw.get("call_id") or _active_tool_calls.pop(tool_name or "", f"call-{turn_id[-8:]}-0")
                 env = {"kind": "tool.completed", "turn_id": turn_id,
-                       "call_id": kw.get("call_id", ""), "tool": tool_name,
+                       "call_id": call_id, "tool": tool_name,
                        "duration": round(kw.get("duration", 0), 3),
                        "error": kw.get("is_error", False),
                        "output_preview": kw.get("output_preview")}
