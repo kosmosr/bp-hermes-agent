@@ -680,7 +680,9 @@ class DesktopAdapter(BasePlatformAdapter):
     async def _broadcast_to_session(self, session_id: str, envelope: dict) -> None:
         """Fan-out one envelope to every subscriber of a session."""
         buf = self._session_buffers[session_id]
-        buf.append(envelope)
+        # Stamp envelope with standard fields before buffering for replay
+        stamped = {"v": 1, "ts": time.time(), **envelope}
+        buf.append(stamped)
 
         for conn_id in list(self._session_subscribers.get(session_id, ())):
             conn = self._connections.get(conn_id)
