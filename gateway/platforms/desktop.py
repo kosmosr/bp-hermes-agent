@@ -107,7 +107,7 @@ class _EnvelopeRingBuffer:
         if not self._buf:
             return [], False
         oldest_seq = self._buf[0][0]
-        gap = seq < oldest_seq
+        gap = seq > 0 and seq < oldest_seq
         result = [env for s, env in self._buf if s > seq]
         return result, gap
 
@@ -170,6 +170,7 @@ class DesktopAdapter(BasePlatformAdapter):
             break
         self._mark_connected()
         logger.info("[desktop] ws listening on ws://%s:%d/ws", self._host, self._port)
+        self._load_sessions_from_db()
         return True
 
     async def disconnect(self):
@@ -280,6 +281,54 @@ class DesktopAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for desktop: %s", e)
         return self._session_db
+
+    def _load_sessions_from_db(self):
+        """Seed _known_sessions from SessionDB (SQLite) for history persistence."""
+        db = self._ensure_session_db()
+        if not db:
+            return
+        try:
+            rows = db.list_sessions_rich(source="desktop", limit=50)
+            for row in rows:
+                sid = row["id"]
+                if sid not in self._known_sessions:
+                    self._known_sessions[sid] = {
+                        "title": row.get("title") or "Untitled",
+                        "created_at": row.get("started_at", 0),
+                    }
+        except Exception as e:
+            logger.debug("Failed to load sessions from DB: %s", e)
+
+    async def _check_and_push_title(self, session_id: str):
+        """Poll session_db for title change and push session.update if changed.
+
+        Also persists the in-memory simple title to session_db as a fallback
+        when the LLM title generator fails (no title in DB after delay).
+        """
+        if session_id not in self._known_sessions:
+            return
+        db = self._ensure_session_db()
+        if not db:
+            return
+        try:
+            db_title = db.get_session_title(session_id)
+            mem_title = self._known_sessions[session_id].get("title")
+            if db_title and db_title != mem_title:
+                # LLM generated a better title → push it to client
+                self._known_sessions[session_id]["title"] = db_title
+                await self._broadcast_to_session(session_id, {
+                    "kind": "session.update",
+                    "session_id": session_id,
+                    "title": db_title,
+                })
+            elif not db_title and mem_title and mem_title not in ("New Chat", "Untitled"):
+                # LLM failed — persist simple title as permanent fallback
+                try:
+                    db.set_session_title(session_id, mem_title)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("Title check failed for %s: %s", session_id, e)
 
     # ------------------------------------------------------------------
     # WebSocket handler
@@ -416,6 +465,8 @@ class DesktopAdapter(BasePlatformAdapter):
             "ping": self._handle_ping,
             "session.list": self._handle_session_list,
             "session.new": self._handle_session_new,
+            "session.delete": self._handle_session_delete,
+            "session.rename": self._handle_session_rename,
             "session.subscribe": self._handle_session_subscribe,
             "prompt.send": self._handle_prompt_send,
             "approval.response": self._handle_approval_response,
@@ -456,11 +507,88 @@ class DesktopAdapter(BasePlatformAdapter):
             "title": title, "created_at": created_at,
         }
         self._session_histories.pop(session_id, None)
+
+        # Persist to DB so empty sessions survive restarts
+        db = self._ensure_session_db()
+        if db:
+            try:
+                db.create_session(session_id=session_id, source="desktop")
+                if title:
+                    db.set_session_title(session_id, title)
+            except Exception as e:
+                logger.warning("[desktop] session.new DB persist failed: %s", e)
+
         await conn.send("session.new.ok", session={
             "session_id": session_id,
             "title": title,
             "created_at": created_at,
         })
+
+    async def _handle_session_delete(self, conn: _Connection, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        if session_id not in self._known_sessions:
+            await conn.send("error", code="SESSION_NOT_FOUND", ref_id=msg.get("id"),
+                            message=f"Session {session_id} not found")
+            return
+        if session_id in self._active_turns:
+            await conn.send("error", code="TURN_IN_PROGRESS", ref_id=msg.get("id"),
+                            message=f"Cannot delete session {session_id} while a turn is running")
+            return
+
+        # Clean up in-memory state
+        self._known_sessions.pop(session_id, None)
+        self._session_buffers.pop(session_id, None)
+        self._session_histories.pop(session_id, None)
+        self._session_subscribers.pop(session_id, None)
+
+        # Delete from DB
+        db = self._ensure_session_db()
+        if db:
+            try:
+                db.delete_session(session_id)
+            except Exception as e:
+                logger.warning("[desktop] session.delete DB failed: %s", e)
+
+        # Broadcast to all connections (multi-window support)
+        for c in list(self._connections.values()):
+            try:
+                await c.send("session.deleted", session_id=session_id)
+            except Exception:
+                pass
+
+    async def _handle_session_rename(self, conn: _Connection, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        title = msg.get("title", "").strip()
+        if session_id not in self._known_sessions:
+            await conn.send("error", code="SESSION_NOT_FOUND", ref_id=msg.get("id"),
+                            message=f"Session {session_id} not found")
+            return
+        if not title or len(title) > 200:
+            await conn.send("error", code="INVALID_TITLE", ref_id=msg.get("id"),
+                            message="Title must be 1-200 characters")
+            return
+
+        # Update in-memory
+        self._known_sessions[session_id]["title"] = title
+
+        # Persist to DB
+        db = self._ensure_session_db()
+        if db:
+            try:
+                db.set_session_title(session_id, title)
+            except ValueError as e:
+                await conn.send("error", code="TITLE_CONFLICT", ref_id=msg.get("id"),
+                                message=str(e))
+                return
+            except Exception as e:
+                logger.warning("[desktop] session.rename DB failed: %s", e)
+
+        # Broadcast session.update to all connections
+        for c in list(self._connections.values()):
+            try:
+                await c.send("session.update", session_id=session_id, title=title)
+            except Exception:
+                pass
 
     async def _handle_session_subscribe(self, conn: _Connection, msg: dict) -> None:
         session_id = msg.get("session_id", "")
@@ -486,6 +614,17 @@ class DesktopAdapter(BasePlatformAdapter):
         logger.info("[desktop] subscribe session=%s since_seq=%s → snapshot(%d events, gap=%s)",
                     session_id, since_seq, len(events), gap)
 
+        # Lazily restore conversation history for historical sessions
+        if session_id not in self._session_histories:
+            db = self._ensure_session_db()
+            if db:
+                try:
+                    msgs = db.get_messages_as_conversation(session_id)
+                    if msgs:
+                        self._session_histories[session_id] = msgs
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Handlers — prompt.send + agent runner
     # ------------------------------------------------------------------
@@ -493,6 +632,7 @@ class DesktopAdapter(BasePlatformAdapter):
     async def _handle_prompt_send(self, conn: _Connection, msg: dict) -> None:
         session_id = msg.get("session_id", "")
         content = msg.get("content", "")
+        model_override = msg.get("model")
 
         if not session_id:
             await conn.send("error", code="PROTO_MISSING_FIELD", ref_id=msg.get("id"),
@@ -583,6 +723,7 @@ class DesktopAdapter(BasePlatformAdapter):
             stream_delta_callback=_on_delta,
             tool_progress_callback=_on_tool_progress,
             reasoning_callback=_on_reasoning,
+            model_override=model_override,
         )
         active.agent = agent
 
@@ -605,7 +746,8 @@ class DesktopAdapter(BasePlatformAdapter):
     def _create_agent_for_turn(self, session_id, stream_delta_callback=None,
                                 tool_progress_callback=None,
                                 reasoning_callback=None,
-                                ephemeral_system_prompt=None):
+                                ephemeral_system_prompt=None,
+                                model_override=None):
         """Create an AIAgent instance — mirrors api_server.py:404 pattern."""
         from run_agent import AIAgent
         from gateway.run import (
@@ -615,7 +757,7 @@ class DesktopAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        model = model_override or _resolve_gateway_model()
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "desktop"))
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -683,6 +825,45 @@ class DesktopAdapter(BasePlatformAdapter):
                     self._session_histories[session_id] = result["messages"]
                 # final_response is skipped — content was already streamed
                 # via _on_delta callback during agent execution.
+
+                # Auto-generate session title after first exchange (non-blocking).
+                # desktop.py bypasses GatewayRunner which normally calls this,
+                # so we invoke it directly here.
+                all_msgs = result.get("messages", []) if result and isinstance(result, dict) else []
+                final_response = result.get("final_response", "") if result and isinstance(result, dict) else ""
+                if not final_response:
+                    # Fallback: extract last assistant message from history
+                    for m in reversed(all_msgs):
+                        if m.get("role") == "assistant" and m.get("content"):
+                            final_response = m["content"]
+                            break
+                if final_response:
+                    db = self._ensure_session_db()
+                    if db:
+                        try:
+                            from agent.title_generator import maybe_auto_title
+                            maybe_auto_title(db, session_id, user_message, final_response, all_msgs)
+                        except Exception:
+                            pass
+
+                # Immediate title from user message — zero latency, no LLM dependency.
+                # Only when title is still the default "New Chat" (first exchange).
+                # Writes only to _known_sessions, NOT session_db, so maybe_auto_title
+                # (which checks session_db) can still generate a better LLM title.
+                session_info = self._known_sessions.get(session_id, {})
+                if session_info.get("title") in ("New Chat", "Untitled"):
+                    simple = user_message.strip()
+                    if len(simple) > 40:
+                        cut = simple[:40].rfind(" ")
+                        simple = (simple[:cut] if cut > 10 else simple[:40]) + "…"
+                    if simple:
+                        session_info["title"] = simple
+                        await self._broadcast_to_session(session_id, {
+                            "kind": "session.update",
+                            "session_id": session_id,
+                            "title": simple,
+                        })
+
                 usage = {
                     "prompt_tokens": getattr(active.agent, "session_prompt_tokens", 0) or 0,
                     "completion_tokens": getattr(active.agent, "session_completion_tokens", 0) or 0,
@@ -691,6 +872,14 @@ class DesktopAdapter(BasePlatformAdapter):
                 await self._broadcast_to_session(session_id, {
                     "kind": "turn.complete", "turn_id": turn_id, "usage": usage,
                 })
+                # Schedule delayed title check — gives title_generator thread
+                # time to complete (generate_title has 30s timeout, so wait 35s).
+                asyncio.get_running_loop().call_later(
+                    35.0,
+                    lambda sid=session_id: asyncio.ensure_future(
+                        self._check_and_push_title(sid)
+                    ),
+                )
             except Exception as exc:
                 logger.exception("[desktop] turn %s failed", turn_id)
                 await self._broadcast_to_session(session_id, {

@@ -52,7 +52,7 @@ def generate_title(user_message: str, assistant_response: str, timeout: float = 
             title = title[:77] + "..."
         return title if title else None
     except Exception as e:
-        logger.debug("Title generation failed: %s", e)
+        logger.warning("Title generation failed: %s", e)
         return None
 
 
