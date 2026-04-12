@@ -413,7 +413,9 @@ class DesktopAdapter(BasePlatformAdapter):
                 capabilities=["approval", "reasoning", "tool_events", "interrupt", "markdown"],
                 server={"version": VERSION, "hermes_version": "0.8.x"},
                 sessions=[
-                    {"session_id": sid, "title": info["title"], "created_at": info.get("created_at")}
+                    {"session_id": sid, "title": info["title"],
+                     "created_at": info.get("created_at"),
+                     "working_dir": info.get("working_dir", "")}
                     for sid, info in self._known_sessions.items()
                 ],
                 commands=welcome_commands,
@@ -495,16 +497,36 @@ class DesktopAdapter(BasePlatformAdapter):
 
     async def _handle_session_list(self, conn: _Connection, msg: dict) -> None:
         await conn.send("session.list.ok", sessions=[
-            {"session_id": sid, "title": info["title"], "created_at": info.get("created_at")}
+            {"session_id": sid, "title": info["title"],
+             "created_at": info.get("created_at"),
+             "working_dir": info.get("working_dir", "")}
             for sid, info in self._known_sessions.items()
         ])
 
     async def _handle_session_new(self, conn: _Connection, msg: dict) -> None:
+        # Validate working_dir
+        working_dir = msg.get("working_dir", "")
+        if not working_dir:
+            await conn.send("session.new.error", code="INVALID_WORKING_DIR",
+                            message="working_dir is required", ref_id=msg.get("id"))
+            return
+        if not os.path.isabs(working_dir):
+            await conn.send("session.new.error", code="INVALID_WORKING_DIR",
+                            message="working_dir must be an absolute path",
+                            ref_id=msg.get("id"))
+            return
+        if not os.path.isdir(working_dir):
+            await conn.send("session.new.error", code="DIR_NOT_FOUND",
+                            message=f"Directory not found: {working_dir}",
+                            ref_id=msg.get("id"))
+            return
+
         session_id = f"sess-{uuid.uuid4().hex[:12]}"
         title = msg.get("title", "New Chat")
         created_at = time.time()
         self._known_sessions[session_id] = {
             "title": title, "created_at": created_at,
+            "working_dir": working_dir,
         }
         self._session_histories.pop(session_id, None)
 
@@ -522,6 +544,7 @@ class DesktopAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "title": title,
             "created_at": created_at,
+            "working_dir": working_dir,
         })
 
     async def _handle_session_delete(self, conn: _Connection, msg: dict) -> None:
@@ -717,6 +740,14 @@ class DesktopAdapter(BasePlatformAdapter):
                     "kind": "reasoning.delta", "turn_id": turn_id, "text": text,
                 }), loop
             )
+
+        # Set TERMINAL_CWD BEFORE agent creation — AIAgent.__init__
+        # snapshots this value at construction time (run_agent.py:1178).
+        session_working_dir = self._known_sessions.get(
+            session_id, {}
+        ).get("working_dir", "")
+        if session_working_dir:
+            os.environ["TERMINAL_CWD"] = session_working_dir
 
         agent = self._create_agent_for_turn(
             session_id=session_id,

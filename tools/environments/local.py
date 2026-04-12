@@ -262,6 +262,7 @@ class LocalEnvironment(BaseEnvironment):
             args,
             text=True,
             env=run_env,
+            cwd=self.cwd if os.path.isdir(self.cwd) else None,
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
