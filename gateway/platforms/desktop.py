@@ -11,11 +11,16 @@ Config (gateway config YAML: platforms.desktop.extra):
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import secrets
+import shutil
+import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -147,16 +152,69 @@ class DesktopAdapter(BasePlatformAdapter):
         )
         # request_id → session_key for pending approvals
         self._pending_approvals: Dict[str, str] = {}
+        # request_id → threading.Event for pending clarify questions
+        self._pending_clarifies: Dict[str, threading.Event] = {}
+        # request_id → answer string for resolved clarify questions
+        self._clarify_results: Dict[str, str] = {}
         # session_id → {title, created_at} — lightweight in-memory registry
         self._known_sessions: Dict[str, dict] = {}
         # session_id -> list of message dicts for agent conversation_history
         self._session_histories: Dict[str, list] = {}
+        # session_id -> model/provider override from model.switch
+        self._session_model_overrides: Dict[str, dict] = {}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _fetch_endpoint_models(self, base_url: str, api_key: str) -> list:
+        """Query an OpenAI-compatible /models endpoint for available model IDs.
+
+        Returns a list of model ID strings, or [] on any error.
+        Timeout: 5 seconds to avoid blocking welcome.
+        """
+        if not base_url:
+            return []
+        url = base_url.rstrip("/")
+        # Handle both /v1 and non-/v1 base URLs
+        if url.endswith("/v1"):
+            url = url + "/models"
+        else:
+            url = url + "/v1/models"
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            import aiohttp as _aiohttp
+            async with _aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=headers,
+                    timeout=_aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.debug("[desktop] /models query returned %d", resp.status)
+                        return []
+                    data = await resp.json()
+                    models = [
+                        m["id"] for m in data.get("data", [])
+                        if isinstance(m, dict) and "id" in m
+                    ]
+                    logger.info("[desktop] fetched %d models from endpoint", len(models))
+                    return models
+        except Exception as exc:
+            logger.debug("[desktop] /models query failed: %s", exc)
+            return []
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter abstract methods
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
+        # Enable the approval system — without this env var,
+        # tools/approval.py auto-approves all commands (see check_all_command_guards).
+        os.environ["HERMES_EXEC_ASK"] = "1"
+        logger.info("[desktop] HERMES_EXEC_ASK set to '1' (approval system enabled)")
+
         self._token = self._load_or_create_token()
         self._app = web.Application()
         self._app.router.add_get("/ws", self._handle_ws)
@@ -278,6 +336,18 @@ class DesktopAdapter(BasePlatformAdapter):
             try:
                 from hermes_state import SessionDB
                 self._session_db = SessionDB()
+                # Create desktop-specific auxiliary table for working_dir persistence.
+                # The upstream sessions table has no working_dir column, so we store
+                # it separately to avoid modifying hermes_state.py.
+                # Use _execute_write for proper BEGIN IMMEDIATE transaction.
+                def _create_meta_table(conn):
+                    conn.execute(
+                        """CREATE TABLE IF NOT EXISTS desktop_session_meta (
+                            session_id TEXT PRIMARY KEY,
+                            working_dir TEXT NOT NULL
+                        )"""
+                    )
+                self._session_db._execute_write(_create_meta_table)
             except Exception as e:
                 logger.debug("SessionDB unavailable for desktop: %s", e)
         return self._session_db
@@ -289,15 +359,32 @@ class DesktopAdapter(BasePlatformAdapter):
             return
         try:
             rows = db.list_sessions_rich(source="desktop", limit=50)
+            # Load working_dir from desktop_session_meta auxiliary table
+            meta_map: Dict[str, str] = {}
+            try:
+                with db._lock:
+                    cursor = db._conn.execute(
+                        "SELECT session_id, working_dir FROM desktop_session_meta"
+                    )
+                    for mrow in cursor.fetchall():
+                        meta_map[mrow[0]] = mrow[1]
+                logger.info("[desktop] loaded %d working_dir entries from desktop_session_meta", len(meta_map))
+            except Exception as e:
+                logger.warning("[desktop] Failed to load desktop_session_meta: %s", e)
+
             for row in rows:
                 sid = row["id"]
                 if sid not in self._known_sessions:
+                    # Sessions missing from desktop_session_meta keep working_dir=""
+                    # so the frontend workspace filter (!s.workingDir) shows them
+                    # in all workspaces rather than hiding them.
                     self._known_sessions[sid] = {
                         "title": row.get("title") or "Untitled",
                         "created_at": row.get("started_at", 0),
+                        "working_dir": meta_map.get(sid, ""),
                     }
         except Exception as e:
-            logger.debug("Failed to load sessions from DB: %s", e)
+            logger.warning("[desktop] Failed to load sessions from DB: %s", e)
 
     async def _check_and_push_title(self, session_id: str):
         """Poll session_db for title change and push session.update if changed.
@@ -330,6 +417,177 @@ class DesktopAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Title check failed for %s: %s", session_id, e)
 
+    @staticmethod
+    def _db_messages_to_snapshot_events(db_msgs: list) -> list:
+        """Convert DB messages (get_messages format) to snapshot events for client replay.
+
+        DB messages have: role, content, timestamp, tool_call_id, tool_calls, etc.
+        Client expects the full event vocabulary: user.message, turn.started,
+        message.delta, reasoning.delta, tool.started, tool.completed, turn.complete.
+        """
+        events: list[dict] = []
+        turn_counter = 0
+        current_turn_id: str | None = None
+
+        for msg in db_msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "") or ""
+            ts = msg.get("timestamp")
+            tool_calls = msg.get("tool_calls")
+            tool_call_id = msg.get("tool_call_id")
+            reasoning = msg.get("reasoning", "") or ""
+
+            if role == "user" and not tool_call_id:
+                # Genuine user message — close any open turn first
+                if current_turn_id:
+                    events.append({"kind": "turn.complete", "turn_id": current_turn_id, "ts": ts})
+                    current_turn_id = None
+                events.append({"kind": "user.message", "content": content, "ts": ts})
+
+            elif role == "assistant":
+                # Close previous open turn before starting a new one
+                if current_turn_id:
+                    events.append({"kind": "turn.complete", "turn_id": current_turn_id, "ts": ts})
+                turn_counter += 1
+                current_turn_id = f"hist-{turn_counter}"
+                events.append({"kind": "turn.started", "turn_id": current_turn_id, "ts": ts})
+
+                if reasoning:
+                    events.append({"kind": "reasoning.delta", "turn_id": current_turn_id, "text": reasoning, "ts": ts})
+                if content:
+                    events.append({"kind": "message.delta", "turn_id": current_turn_id, "text": content, "ts": ts})
+
+                if tool_calls and isinstance(tool_calls, list):
+                    for i, tc in enumerate(tool_calls):
+                        call_id = tc.get("id", f"call-hist-{turn_counter}-{i}")
+                        func = tc.get("function", {})
+                        tool_name = func.get("name", "unknown")
+                        args_str = func.get("arguments", "")
+                        events.append({
+                            "kind": "tool.started",
+                            "turn_id": current_turn_id,
+                            "call_id": call_id,
+                            "tool": tool_name,
+                            "preview": (args_str[:80] if args_str else None),
+                            "ts": ts,
+                        })
+                    # Keep turn open — tool results will follow
+                else:
+                    # No tool calls — close turn immediately
+                    events.append({"kind": "turn.complete", "turn_id": current_turn_id, "ts": ts})
+                    current_turn_id = None
+
+            elif role == "tool" or (role == "user" and tool_call_id):
+                # Tool result — emit tool.completed within the open turn
+                if current_turn_id:
+                    events.append({
+                        "kind": "tool.completed",
+                        "turn_id": current_turn_id,
+                        "call_id": tool_call_id or "call-hist-unknown",
+                        "tool": msg.get("tool_name", "unknown"),
+                        "duration": 0,
+                        "error": False,
+                        "output_preview": (content[:200] if content else None),
+                        "ts": ts,
+                    })
+
+        # Close any dangling turn at the end
+        if current_turn_id:
+            events.append({"kind": "turn.complete", "turn_id": current_turn_id, "ts": ts})
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Media helpers (4A / 4B)
+    # ------------------------------------------------------------------
+
+    def _cache_file(self, src_path: str) -> str:
+        """Copy a local file into ~/.hermes/cache/media/{sha256_first16}.{ext}.
+
+        Returns the cached file path. Skips copy if already cached.
+        """
+        cache_dir = Path("~/.hermes/cache/media").expanduser()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(src_path, "rb") as f:
+            h = hashlib.sha256()
+            while chunk := f.read(8192):
+                h.update(chunk)
+            file_hash = h.hexdigest()[:16]
+
+        ext = Path(src_path).suffix
+        cached = cache_dir / f"{file_hash}{ext}"
+        if not cached.exists():
+            shutil.copy2(src_path, cached)
+        return str(cached)
+
+    async def _post_process_media(
+        self, session_id: str, turn_id: str, final_response: str,
+    ) -> None:
+        """Extract images, MEDIA: tags, and local files from agent response, broadcast structured envelopes."""
+        # 1. Extract MEDIA: tagged paths (agent uses this for all file outputs)
+        media_items, cleaned_text = BasePlatformAdapter.extract_media(final_response)
+        for file_path, _is_voice in media_items:
+            expanded = os.path.expanduser(file_path)
+            if os.path.isfile(expanded):
+                ext_lower = os.path.splitext(expanded)[1].lower()
+                is_image = ext_lower in ('.png', '.jpg', '.jpeg', '.gif', '.webp')
+                try:
+                    cached_path = self._cache_file(expanded)
+                    stat_info = os.stat(cached_path)
+                    mime, _ = mimetypes.guess_type(expanded)
+                    if is_image:
+                        await self._broadcast_to_session(session_id, {
+                            "kind": "content.image",
+                            "turn_id": turn_id,
+                            "url": f"hermes-media://{cached_path}",
+                            "alt": os.path.basename(expanded),
+                        })
+                    else:
+                        await self._broadcast_to_session(session_id, {
+                            "kind": "content.file",
+                            "turn_id": turn_id,
+                            "name": os.path.basename(expanded),
+                            "path": cached_path,
+                            "size": stat_info.st_size,
+                            "mime": mime,
+                        })
+                except Exception as e:
+                    logger.warning("[desktop] _post_process_media: failed to cache MEDIA path %s: %s", file_path, e)
+            else:
+                logger.warning("[desktop] _post_process_media: MEDIA file not found: %s", file_path)
+
+        # 2. Extract markdown/HTML image URLs from remaining text
+        images, cleaned_text = BasePlatformAdapter.extract_images(cleaned_text)
+        for url, alt in images:
+            await self._broadcast_to_session(session_id, {
+                "kind": "content.image",
+                "turn_id": turn_id,
+                "url": url,
+                "alt": alt,
+            })
+
+        # 3. Extract bare local file paths
+        local_files, _final_text = BasePlatformAdapter.extract_local_files(cleaned_text)
+        for file_path in local_files:
+            try:
+                if not os.path.isfile(file_path):
+                    logger.warning("[desktop] _post_process_media: file not found: %s", file_path)
+                    continue
+                cached_path = self._cache_file(file_path)
+                stat = os.stat(cached_path)
+                mime, _ = mimetypes.guess_type(file_path)
+                await self._broadcast_to_session(session_id, {
+                    "kind": "content.file",
+                    "turn_id": turn_id,
+                    "name": os.path.basename(file_path),
+                    "path": cached_path,
+                    "size": stat.st_size,
+                    "mime": mime,
+                })
+            except Exception as e:
+                logger.warning("[desktop] _post_process_media: failed to cache %s: %s", file_path, e)
+
     # ------------------------------------------------------------------
     # WebSocket handler
     # ------------------------------------------------------------------
@@ -345,7 +603,7 @@ class DesktopAdapter(BasePlatformAdapter):
         if len(self._connections) >= self._max_conn:
             raise web.HTTPServiceUnavailable(text="Too many connections")
 
-        ws = web.WebSocketResponse(max_msg_size=1_048_576)  # 1 MB
+        ws = web.WebSocketResponse(max_msg_size=16_777_216)  # 16 MB — accommodate base64 file attachments
         await ws.prepare(request)
 
         # Protocol version check — client should send v=1
@@ -407,6 +665,53 @@ class DesktopAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("[desktop] could not load skills for welcome")
 
+            welcome_models = {}
+            try:
+                from hermes_cli.model_switch import list_authenticated_providers
+                from gateway.run import _load_gateway_config, _resolve_gateway_model
+                cfg = _load_gateway_config()
+                model_cfg = cfg.get("model", {})
+                current_provider = model_cfg.get("provider", "openrouter") if isinstance(model_cfg, dict) else "openrouter"
+                current_model = _resolve_gateway_model(cfg)
+
+                # For custom/local providers, query the endpoint's /models API
+                # instead of relying on models.dev (which doesn't know about proxies).
+                _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
+                if current_provider in _LOCAL_PROVIDERS:
+                    base_url = (model_cfg.get("base_url", "")
+                                if isinstance(model_cfg, dict) else "")
+                    api_key = (model_cfg.get("api_key", "")
+                               if isinstance(model_cfg, dict) else "")
+                    if not api_key:
+                        # Try common env vars
+                        api_key = (os.environ.get("OPENAI_API_KEY")
+                                   or os.environ.get("ANTHROPIC_API_KEY")
+                                   or os.environ.get("API_KEY") or "")
+                    proxy_models = await self._fetch_endpoint_models(base_url, api_key)
+                    providers = [{
+                        "slug": current_provider,
+                        "name": current_provider.title(),
+                        "is_current": True,
+                        "is_user_defined": True,
+                        "models": proxy_models if proxy_models else [current_model],
+                        "total_models": len(proxy_models) if proxy_models else 1,
+                        "source": "endpoint",
+                    }]
+                else:
+                    providers = list_authenticated_providers(
+                        current_provider=current_provider,
+                        user_providers=cfg.get("providers"),
+                        max_models=20,
+                    )
+
+                welcome_models = {
+                    "providers": providers,
+                    "current_model": current_model,
+                    "current_provider": current_provider,
+                }
+            except Exception:
+                logger.debug("[desktop] could not load model catalog for welcome")
+
             # Send welcome
             await conn.send(
                 "welcome",
@@ -421,15 +726,16 @@ class DesktopAdapter(BasePlatformAdapter):
                 commands=welcome_commands,
                 toolsets=welcome_toolsets,
                 skills=welcome_skills,
+                models=welcome_models,
                 working_dir=os.environ.get("TERMINAL_CWD", ""),
             )
 
             # Message loop
             async for raw_msg in ws:
                 if raw_msg.type == web.WSMsgType.TEXT:
-                    if len(raw_msg.data) > 1_048_576:
+                    if len(raw_msg.data) > 16_777_216:
                         await conn.send("error", code="PROTO_FRAME_TOO_LARGE",
-                                        message="Envelope exceeds 1 MB limit")
+                                        message="Envelope exceeds 16 MB limit")
                         await ws.close(code=4413, message=b"frame too large")
                         break
                     try:
@@ -472,7 +778,9 @@ class DesktopAdapter(BasePlatformAdapter):
             "session.subscribe": self._handle_session_subscribe,
             "prompt.send": self._handle_prompt_send,
             "approval.response": self._handle_approval_response,
+            "clarify.response": self._handle_clarify_response,
             "turn.interrupt": self._handle_turn_interrupt,
+            "model.switch": self._handle_model_switch,
         }
         handler = handler_map.get(kind)
         if handler is None:
@@ -535,10 +843,25 @@ class DesktopAdapter(BasePlatformAdapter):
         if db:
             try:
                 db.create_session(session_id=session_id, source="desktop")
-                if title:
-                    db.set_session_title(session_id, title)
             except Exception as e:
-                logger.warning("[desktop] session.new DB persist failed: %s", e)
+                logger.warning("[desktop] session.new create_session failed: %s", e)
+            # Persist working_dir — must not be blocked by title errors
+            try:
+                def _persist_wd(conn):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO desktop_session_meta (session_id, working_dir) VALUES (?, ?)",
+                        (session_id, working_dir),
+                    )
+                db._execute_write(_persist_wd)
+            except Exception as e:
+                logger.warning("[desktop] session.new meta persist failed: %s", e)
+            # Title is best-effort — set_session_title raises ValueError on
+            # duplicate titles, which must not block the working_dir persist above.
+            if title:
+                try:
+                    db.set_session_title(session_id, title)
+                except Exception as e:
+                    logger.debug("[desktop] session.new set_title failed (non-fatal): %s", e)
 
         await conn.send("session.new.ok", session={
             "session_id": session_id,
@@ -569,6 +892,13 @@ class DesktopAdapter(BasePlatformAdapter):
         if db:
             try:
                 db.delete_session(session_id)
+                # Clean up desktop-specific auxiliary table
+                def _del_meta(conn):
+                    conn.execute(
+                        "DELETE FROM desktop_session_meta WHERE session_id = ?",
+                        (session_id,),
+                    )
+                db._execute_write(_del_meta)
             except Exception as e:
                 logger.warning("[desktop] session.delete DB failed: %s", e)
 
@@ -629,11 +959,29 @@ class DesktopAdapter(BasePlatformAdapter):
         since_seq = msg.get("since_seq", 0)
         buf = self._session_buffers[session_id]
         events, gap = buf.since(since_seq)
+
+        # If ring buffer is empty (e.g. after gateway restart), rebuild
+        # snapshot events from DB messages so the client can display history.
+        if not events and since_seq == 0:
+            db = self._ensure_session_db()
+            if db:
+                try:
+                    db_msgs = db.get_messages(session_id)
+                    if db_msgs:
+                        events = self._db_messages_to_snapshot_events(db_msgs)
+                        gap = False
+                        logger.info("[desktop] rebuilt %d snapshot events from DB for session=%s",
+                                    len(events), session_id)
+                except Exception as e:
+                    logger.warning("[desktop] failed to rebuild snapshot from DB: %s", e)
+
+        working_dir = self._known_sessions.get(session_id, {}).get("working_dir", "")
         await conn.send("session.snapshot",
                         session_id=session_id,
                         events=events,
                         max_seq=buf.max_seq,
-                        gap=gap)
+                        gap=gap,
+                        working_dir=working_dir)
         logger.info("[desktop] subscribe session=%s since_seq=%s → snapshot(%d events, gap=%s)",
                     session_id, since_seq, len(events), gap)
 
@@ -649,6 +997,114 @@ class DesktopAdapter(BasePlatformAdapter):
                     pass
 
     # ------------------------------------------------------------------
+    # Handler — model.switch
+    # ------------------------------------------------------------------
+
+    async def _handle_model_switch(self, conn: _Connection, msg: dict) -> None:
+        session_id = msg.get("session_id", "")
+        model_id = msg.get("model_id", "")
+        provider_slug = msg.get("provider_slug", "")
+
+        if not session_id or not model_id:
+            await conn.send("model.switch.error", ref_id=msg.get("id"),
+                            session_id=session_id,
+                            code="PROTO_MISSING_FIELD",
+                            message="session_id and model_id are required")
+            return
+
+        try:
+            from hermes_cli.model_switch import switch_model as _switch_model
+            from gateway.run import _load_gateway_config, _resolve_gateway_model
+
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {})
+            cfg_provider = (model_cfg.get("provider", "openrouter")
+                            if isinstance(model_cfg, dict) else "openrouter")
+            cur_provider = cfg_provider
+            cur_model = _resolve_gateway_model(cfg)
+            cfg_base_url = (model_cfg.get("base_url", "")
+                            if isinstance(model_cfg, dict) else "")
+
+            # Apply existing session override as baseline
+            override = self._session_model_overrides.get(session_id, {})
+            if override:
+                cur_model = override.get("model", cur_model)
+                cur_provider = override.get("provider", cur_provider) or cur_provider
+
+            # Detect custom/local provider — these use a single endpoint
+            # that serves multiple models, so switching should only change
+            # the model name, NOT the provider/credentials.
+            _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
+            is_local = cfg_provider in _LOCAL_PROVIDERS
+
+            if is_local:
+                # For custom providers: just update the model name, keep
+                # the current provider, base_url, and api_key intact.
+                self._session_model_overrides[session_id] = {
+                    "model": model_id,
+                    "provider": "",   # empty = inherit from config
+                    "api_key": "",
+                    "base_url": "",
+                    "api_mode": "",
+                }
+                await conn.send(
+                    "model.switch.ok",
+                    ref_id=msg.get("id"),
+                    session_id=session_id,
+                    model=model_id,
+                    provider=cfg_provider,
+                    provider_label=cfg_provider,
+                )
+                logger.info("[desktop] model.switch (local) session=%s → %s (%s)",
+                            session_id, model_id, cfg_provider)
+                return
+
+            result = _switch_model(
+                raw_input=model_id,
+                current_provider=cur_provider,
+                current_model=cur_model,
+                explicit_provider=provider_slug or "",
+            )
+
+            if result.success:
+                self._session_model_overrides[session_id] = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key or "",
+                    "base_url": result.base_url or "",
+                    "api_mode": getattr(result, "api_mode", "") or "",
+                }
+                await conn.send(
+                    "model.switch.ok",
+                    ref_id=msg.get("id"),
+                    session_id=session_id,
+                    model=result.new_model,
+                    provider=result.target_provider,
+                    provider_label=getattr(result, "provider_label", "") or result.target_provider,
+                )
+                logger.info("[desktop] model.switch session=%s → %s (%s)",
+                            session_id, result.new_model, result.target_provider)
+            else:
+                await conn.send(
+                    "model.switch.error",
+                    ref_id=msg.get("id"),
+                    session_id=session_id,
+                    code="MODEL_SWITCH_FAILED",
+                    message=result.error_message or "Unknown error",
+                )
+                logger.warning("[desktop] model.switch failed session=%s model=%s: %s",
+                               session_id, model_id, result.error_message)
+        except Exception as exc:
+            logger.exception("[desktop] model.switch error")
+            await conn.send(
+                "model.switch.error",
+                ref_id=msg.get("id"),
+                session_id=session_id,
+                code="MODEL_SWITCH_INTERNAL",
+                message=str(exc),
+            )
+
+    # ------------------------------------------------------------------
     # Handlers — prompt.send + agent runner
     # ------------------------------------------------------------------
 
@@ -661,7 +1117,7 @@ class DesktopAdapter(BasePlatformAdapter):
             await conn.send("error", code="PROTO_MISSING_FIELD", ref_id=msg.get("id"),
                             message="session_id is required")
             return
-        if not content:
+        if not content and not msg.get("attachments"):
             await conn.send("error", code="PROTO_MISSING_FIELD", ref_id=msg.get("id"),
                             message="content is required")
             return
@@ -678,6 +1134,62 @@ class DesktopAdapter(BasePlatformAdapter):
             await conn.send("error", code="AGENT_BUSY", ref_id=msg.get("id"),
                             message="Agent thread pool is full, retry later")
             return
+
+        # --- File upload (4B) ---
+        ALLOWED_EXTENSIONS = {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".pdf", ".md", ".txt", ".csv", ".json",
+            ".yaml", ".yml", ".py", ".js", ".ts",
+            ".html", ".css",
+        }
+        MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
+
+        attachments = msg.get("attachments", [])
+        file_refs: list[str] = []
+        upload_dir = Path("~/.hermes/cache/uploads").expanduser()
+
+        for att in attachments:
+            name = att.get("name", "")
+            data_b64 = att.get("data", "")
+            if not name or not data_b64:
+                continue
+
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                await conn.send("error", code="FILE_TYPE_NOT_ALLOWED",
+                                ref_id=msg.get("id"),
+                                message=f"File type {ext} is not allowed")
+                return
+
+            try:
+                raw = base64.b64decode(data_b64)
+            except Exception:
+                await conn.send("error", code="FILE_DECODE_ERROR",
+                                ref_id=msg.get("id"),
+                                message=f"Failed to decode base64 for {name}")
+                return
+
+            if len(raw) > MAX_UPLOAD_SIZE:
+                await conn.send("error", code="FILE_TOO_LARGE",
+                                ref_id=msg.get("id"),
+                                message=f"File {name} exceeds 10 MB limit")
+                return
+
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            saved_name = f"{uuid.uuid4().hex}_{name}"
+            saved_path = str(upload_dir / saved_name)
+            with open(saved_path, "wb") as f:
+                f.write(raw)
+
+            await conn.send("file.upload.ok", name=name, path=saved_path)
+            file_refs.append(f"[附件: {name} → {saved_path}]")
+            logger.info("[desktop] file.upload.ok name=%s path=%s size=%d",
+                        name, saved_path, len(raw))
+
+        # Prepend file references to user content
+        if file_refs:
+            prefix = "\n".join(file_refs) + "\n\n"
+            content = prefix + content
 
         turn_id = f"turn-{uuid.uuid4().hex[:12]}"
         session_key = f"desktop:{session_id}"
@@ -754,6 +1266,7 @@ class DesktopAdapter(BasePlatformAdapter):
             stream_delta_callback=_on_delta,
             tool_progress_callback=_on_tool_progress,
             reasoning_callback=_on_reasoning,
+            clarify_callback=self._make_clarify_callback(session_id, turn_id, loop),
             model_override=model_override,
         )
         active.agent = agent
@@ -777,9 +1290,16 @@ class DesktopAdapter(BasePlatformAdapter):
     def _create_agent_for_turn(self, session_id, stream_delta_callback=None,
                                 tool_progress_callback=None,
                                 reasoning_callback=None,
+                                clarify_callback=None,
                                 ephemeral_system_prompt=None,
                                 model_override=None):
-        """Create an AIAgent instance — mirrors api_server.py:404 pattern."""
+        """Create an AIAgent instance — mirrors api_server.py:404 pattern.
+
+        Model resolution precedence:
+          1. model_override (per-message from prompt.send) — resolved via switch_model()
+          2. _session_model_overrides (from model.switch envelope)
+          3. _resolve_gateway_model() (config.yaml default)
+        """
         from run_agent import AIAgent
         from gateway.run import (
             _resolve_runtime_agent_kwargs, _resolve_gateway_model,
@@ -788,8 +1308,58 @@ class DesktopAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = model_override or _resolve_gateway_model()
         user_config = _load_gateway_config()
+        session_override = self._session_model_overrides.get(session_id, {})
+
+        if model_override:
+            # Per-message override — for custom/local providers, just use the
+            # model name as-is (the endpoint serves multiple models).
+            # For cloud providers, resolve through the alias system.
+            model_cfg = user_config.get("model", {})
+            cfg_provider = (model_cfg.get("provider") if isinstance(model_cfg, dict) else "openrouter") or "openrouter"
+            _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
+            if cfg_provider in _LOCAL_PROVIDERS:
+                model = model_override
+            else:
+                try:
+                    from hermes_cli.model_switch import switch_model as _switch_model
+                    cur_prov = (session_override.get("provider") or cfg_provider)
+                    cur_mod = session_override.get("model") or _resolve_gateway_model(user_config)
+                    result = _switch_model(
+                        raw_input=model_override,
+                        current_provider=cur_prov,
+                        current_model=cur_mod,
+                    )
+                    if result.success:
+                        model = result.new_model
+                        if result.target_provider:
+                            runtime_kwargs["provider"] = result.target_provider
+                        if result.api_key:
+                            runtime_kwargs["api_key"] = result.api_key
+                        if result.base_url:
+                            runtime_kwargs["base_url"] = result.base_url
+                        if result.api_mode:
+                            runtime_kwargs["api_mode"] = result.api_mode
+                    else:
+                        logger.warning("[desktop] model override '%s' resolution failed: %s",
+                                       model_override, result.error_message)
+                        model = _resolve_gateway_model(user_config)
+                except Exception as exc:
+                    logger.warning("[desktop] model override resolution error: %s", exc)
+                    model = _resolve_gateway_model(user_config)
+        elif session_override:
+            model = session_override["model"]
+            if session_override.get("provider"):
+                runtime_kwargs["provider"] = session_override["provider"]
+            if session_override.get("api_key"):
+                runtime_kwargs["api_key"] = session_override["api_key"]
+            if session_override.get("base_url"):
+                runtime_kwargs["base_url"] = session_override["base_url"]
+            if session_override.get("api_mode"):
+                runtime_kwargs["api_mode"] = session_override["api_mode"]
+        else:
+            model = _resolve_gateway_model(user_config)
+
         enabled_toolsets = sorted(_get_platform_tools(user_config, "desktop"))
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
         fallback_model = GatewayRunner._load_fallback_model()
@@ -805,6 +1375,7 @@ class DesktopAdapter(BasePlatformAdapter):
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             reasoning_callback=reasoning_callback,
+            clarify_callback=clarify_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -823,10 +1394,33 @@ class DesktopAdapter(BasePlatformAdapter):
         session_key = active.session_key
         loop = asyncio.get_running_loop()
 
+        # Set both contextvar AND env var for session key propagation.
+        # Contextvar doesn't reliably propagate through run_in_executor,
+        # so the env var serves as fallback (same pattern as upstream run.py:6633).
         approval_token = set_current_session_key(session_key)
+        os.environ["HERMES_SESSION_KEY"] = session_key
 
         def _notify(approval_data: dict) -> None:
-            logger.warning("[desktop] _notify fallback called for session=%s", session_key)
+            """Forward approval request to connected desktop clients.
+
+            Called from the agent thread (sync); must schedule the async
+            send_exec_approval on the event loop and block until it completes
+            — mirroring upstream run.py:_approval_notify_sync.
+            """
+            cmd = approval_data.get("command", "")
+            desc = approval_data.get("description", "dangerous command")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.send_exec_approval(
+                        chat_id=session_id,
+                        command=cmd,
+                        session_key=session_key,
+                        description=desc,
+                    ),
+                    loop,
+                ).result(timeout=15)
+            except Exception as exc:
+                logger.error("[desktop] send_exec_approval failed: %s", exc)
 
         try:
             register_gateway_notify(session_key, _notify)
@@ -895,6 +1489,10 @@ class DesktopAdapter(BasePlatformAdapter):
                             "title": simple,
                         })
 
+                # Extract media (images, local files) from agent response
+                if final_response:
+                    await self._post_process_media(session_id, turn_id, final_response)
+
                 usage = {
                     "prompt_tokens": getattr(active.agent, "session_prompt_tokens", 0) or 0,
                     "completion_tokens": getattr(active.agent, "session_completion_tokens", 0) or 0,
@@ -920,6 +1518,7 @@ class DesktopAdapter(BasePlatformAdapter):
             finally:
                 unregister_gateway_notify(session_key)
                 reset_current_session_key(approval_token)
+                os.environ.pop("HERMES_SESSION_KEY", None)
                 self._active_turns.pop(session_id, None)
 
     # ------------------------------------------------------------------
@@ -980,6 +1579,87 @@ class DesktopAdapter(BasePlatformAdapter):
             })
         logger.info("[desktop] approval.resolved session=%s req=%s outcome=%s",
                      sid, request_id, outcome)
+
+    # ------------------------------------------------------------------
+    # Handlers — clarify
+    # ------------------------------------------------------------------
+
+    def _make_clarify_callback(self, session_id: str, turn_id: str, loop: asyncio.AbstractEventLoop):
+        """Create a clarify callback for an agent turn.
+
+        Returns a sync callback (question, choices) -> str that blocks the
+        agent thread until the desktop client responds or 120s timeout.
+        """
+        def _callback(question, choices):
+            request_id = f"clar-{uuid.uuid4().hex[:10]}"
+            event = threading.Event()
+            self._pending_clarifies[request_id] = event
+
+            # Broadcast clarify.request to subscribed clients
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_to_session(session_id, {
+                        "kind": "clarify.request",
+                        "turn_id": turn_id,
+                        "request_id": request_id,
+                        "question": question,
+                        "choices": choices,
+                    }),
+                    loop,
+                ).result(timeout=5)
+            except Exception as exc:
+                logger.error("[desktop] clarify.request broadcast failed: %s", exc)
+                self._pending_clarifies.pop(request_id, None)
+                return "(发送失败，请自行判断)"
+
+            logger.info("[desktop] clarify.request session=%s req=%s question=%r",
+                         session_id, request_id, question[:80])
+
+            # Block agent thread until client responds (120s timeout)
+            resolved = event.wait(timeout=120)
+            self._pending_clarifies.pop(request_id, None)
+            answer = self._clarify_results.pop(request_id, None)
+
+            if not resolved or answer is None:
+                # Broadcast timeout resolved
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_to_session(session_id, {
+                        "kind": "clarify.resolved",
+                        "request_id": request_id,
+                        "answer": "",
+                        "timed_out": True,
+                    }),
+                    loop,
+                )
+                logger.info("[desktop] clarify timeout session=%s req=%s", session_id, request_id)
+                return "(用户未回答，请自行判断)"
+
+            return answer
+
+        return _callback
+
+    async def _handle_clarify_response(self, conn: _Connection, msg: dict) -> None:
+        """Handle clarify.response from client — unblock the waiting agent thread."""
+        request_id = msg.get("request_id", "")
+        answer = msg.get("answer", "")
+
+        event = self._pending_clarifies.get(request_id)
+        if not event:
+            return  # already resolved or timed out
+
+        self._clarify_results[request_id] = answer
+        event.set()
+
+        # Broadcast clarify.resolved to all subscribers
+        sid = conn.subscribed_session_id
+        if sid:
+            await self._broadcast_to_session(sid, {
+                "kind": "clarify.resolved",
+                "request_id": request_id,
+                "answer": answer,
+            })
+        logger.info("[desktop] clarify.resolved session=%s req=%s answer=%r",
+                     sid, request_id, answer[:80] if answer else "")
 
     # ------------------------------------------------------------------
     # Handlers — interrupt
