@@ -23,6 +23,35 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# ── Global SSRF bypass (read once from config, cached) ──────────────
+_ssrf_disabled: bool | None = None
+
+
+def _is_ssrf_disabled() -> bool:
+    """Return True when SSRF protection is globally disabled via config.
+
+    Reads ``security.disable_ssrf_protection`` from ``~/.hermes/config.yaml``
+    once and caches for the process lifetime.  Useful for local environments
+    where a VPN/proxy resolves all domains to private-range IPs (e.g.
+    198.18.0.0/15 for transparent proxying), which would otherwise block
+    every URL.
+    """
+    global _ssrf_disabled
+    if _ssrf_disabled is not None:
+        return _ssrf_disabled
+    _ssrf_disabled = False
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        _ssrf_disabled = bool(
+            cfg.get("security", {}).get("disable_ssrf_protection")
+        )
+    except Exception:
+        pass
+    if _ssrf_disabled:
+        logger.info("SSRF protection globally disabled via config")
+    return _ssrf_disabled
+
 # Hostnames that should always be blocked regardless of IP resolution
 _BLOCKED_HOSTNAMES = frozenset({
     "metadata.google.internal",
@@ -53,7 +82,13 @@ def is_safe_url(url: str) -> bool:
 
     Resolves the hostname to an IP and checks against private ranges.
     Fails closed: DNS errors and unexpected exceptions block the request.
+
+    Returns True immediately when ``security.disable_ssrf_protection``
+    is set in the hermes config (local environments with VPN/proxy).
     """
+    if _is_ssrf_disabled():
+        return True
+
     try:
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").strip().lower()

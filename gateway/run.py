@@ -1751,9 +1751,15 @@ class GatewayRunner:
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
-        
+
         Returns True if at least one adapter connected successfully.
         """
+        # Enable gateway-mode approval prompts so dangerous commands trigger
+        # approval.request instead of being auto-approved.  Without this,
+        # check_dangerous_command() in tools/approval.py short-circuits at the
+        # ``not is_cli and not is_gateway`` guard (line 572).
+        os.environ.setdefault("HERMES_GATEWAY_SESSION", "1")
+
         logger.info("Starting Hermes Gateway...")
         logger.info("Session storage: %s", self.config.sessions_dir)
         try:

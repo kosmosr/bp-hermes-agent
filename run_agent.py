@@ -8349,6 +8349,26 @@ class AIAgent:
             if stored_prompt:
                 # Continuing session — reuse the exact system prompt from
                 # the previous turn so the Anthropic cache prefix matches.
+                # However, if the model changed (via model.switch), patch
+                # the Model/Provider lines so the agent's self-awareness
+                # matches the actual model being used for this turn.
+                import re as _re
+                _old_model_match = _re.search(r"(?m)^Model: (.+)$", stored_prompt)
+                _old_model = _old_model_match.group(1) if _old_model_match else ""
+                if self.model and _old_model and _old_model != self.model:
+                    stored_prompt = _re.sub(
+                        r"(?m)^Model: .+$",
+                        f"Model: {self.model}",
+                        stored_prompt,
+                    )
+                    if self.provider:
+                        stored_prompt = _re.sub(
+                            r"(?m)^Provider: .+$",
+                            f"Provider: {self.provider}",
+                            stored_prompt,
+                        )
+                    logger.info("Patched system prompt model: %s → %s",
+                                _old_model, self.model)
                 self._cached_system_prompt = stored_prompt
             else:
                 # First turn of a new session — build from scratch.
