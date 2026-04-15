@@ -562,9 +562,17 @@ class DesktopAdapter(BasePlatformAdapter):
                             "turn_id": current_turn_id,
                             "call_id": call_id,
                             "tool": tool_name,
-                            "preview": (args_str[:80] if args_str else None),
                             "ts": ts,
                         }
+                        # Parse args and build human-readable preview
+                        try:
+                            import json as _json
+                            args_dict = _json.loads(args_str) if args_str else None
+                            tool_event["args"] = args_dict
+                            from agent.display import build_tool_preview
+                            tool_event["preview"] = build_tool_preview(tool_name, args_dict or {}) or (args_str[:80] if args_str else None)
+                        except Exception:
+                            tool_event["preview"] = (args_str[:80] if args_str else None)
                         # Attach tool metadata for desktop frontend
                         try:
                             from tools.registry import registry
