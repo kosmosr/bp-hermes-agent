@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import mimetypes
+import re
 import os
 import secrets
 import shutil
@@ -81,6 +82,97 @@ class _ActiveTurn:
     agent: Any = None
     task: Optional[asyncio.Task] = None
     session_key: str = ""
+    debouncer: Optional[_OutputDebouncer] = None
+
+
+# ANSI escape sequence pattern — comprehensive 7-bit C1 catch-all.
+# Matches SGR (\x1b[...m), cursor movement, OSC, and all CSI sequences.
+_ANSI_RE = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+class _OutputDebouncer:
+    """Aggregate tool output into 200ms batches per call_id.
+
+    Thread-safe: push() is called from the agent thread (synchronous),
+    schedules work onto the asyncio event loop. All timer/flush logic
+    runs on the event loop thread.
+    """
+
+    INTERVAL = 0.2        # 200ms debounce window
+    MAX_FLUSH_SIZE = 65536  # 64KB per flush
+
+    def __init__(self, broadcast_fn, session_id: str, turn_id: str, loop):
+        self._broadcast = broadcast_fn
+        self._session_id = session_id
+        self._turn_id = turn_id
+        self._loop = loop
+        self._pending: Dict[str, Dict[str, str]] = {}  # call_id → {stream → text}
+        self._timers: Dict[str, asyncio.TimerHandle] = {}
+
+    def push(self, call_id: str, stream: str, text: str) -> None:
+        """Thread-safe: schedule aggregation onto the event loop."""
+        self._loop.call_soon_threadsafe(self._push_on_loop, call_id, stream, text)
+
+    def _push_on_loop(self, call_id: str, stream: str, text: str) -> None:
+        """Runs on event loop thread. Aggregates text and manages timers."""
+        if call_id not in self._pending:
+            self._pending[call_id] = {}
+        if call_id not in self._timers:
+            self._timers[call_id] = self._loop.call_later(
+                self.INTERVAL, lambda k=call_id: asyncio.ensure_future(self._flush(k))
+            )
+        buf = self._pending[call_id]
+        buf[stream] = buf.get(stream, "") + text
+
+    async def _flush(self, call_id: str) -> None:
+        """Flush aggregated text for call_id as envelope(s).
+
+        After flushing, checks if new data arrived during the async
+        broadcast and re-arms the timer if so (fixes re-entry race).
+        """
+        self._timers.pop(call_id, None)
+        entries = self._pending.pop(call_id, {})
+        for stream, text in entries.items():
+            if not text:
+                continue
+            if len(text) > self.MAX_FLUSH_SIZE:
+                text = text[:self.MAX_FLUSH_SIZE] + "\n...[truncated]"
+            text = _ANSI_RE.sub('', text)
+            try:
+                await self._broadcast(
+                    self._session_id,
+                    {"kind": "tool.output.delta", "turn_id": self._turn_id,
+                     "call_id": call_id, "stream": stream, "text": text},
+                    skip_buffer=True,
+                )
+            except Exception as exc:
+                logger.warning("[desktop] debouncer flush error: %s", exc)
+        # Re-arm: if new data arrived while we were awaiting broadcast,
+        # _push_on_loop would have added to _pending but NOT created a
+        # timer (because we popped _timers before the await). Schedule
+        # another flush to prevent orphaned data.
+        if call_id in self._pending and call_id not in self._timers:
+            self._timers[call_id] = self._loop.call_later(
+                self.INTERVAL, lambda k=call_id: asyncio.ensure_future(self._flush(k))
+            )
+
+    async def flush_all(self, call_id: str) -> None:
+        """Force-flush before tool.completed. Cancel pending timer."""
+        handle = self._timers.pop(call_id, None)
+        if handle:
+            handle.cancel()
+        await self._flush(call_id)
+
+    def cancel_all(self) -> None:
+        """Cancel all pending timers and discard buffers.
+
+        Call on turn.complete / turn.error / turn.interrupt to prevent
+        stale flushes after the turn has ended.
+        """
+        for handle in self._timers.values():
+            handle.cancel()
+        self._timers.clear()
+        self._pending.clear()
 
 
 class _EnvelopeRingBuffer:
@@ -162,6 +254,8 @@ class DesktopAdapter(BasePlatformAdapter):
         self._session_histories: Dict[str, list] = {}
         # session_id -> model/provider override from model.switch
         self._session_model_overrides: Dict[str, dict] = {}
+        # Persistent MemoryStore for between-turn memory.read/update access
+        self._memory_store = None  # lazy init in _ensure_memory_store
 
     # ------------------------------------------------------------------
     # Helpers
@@ -463,14 +557,24 @@ class DesktopAdapter(BasePlatformAdapter):
                         func = tc.get("function", {})
                         tool_name = func.get("name", "unknown")
                         args_str = func.get("arguments", "")
-                        events.append({
+                        tool_event = {
                             "kind": "tool.started",
                             "turn_id": current_turn_id,
                             "call_id": call_id,
                             "tool": tool_name,
                             "preview": (args_str[:80] if args_str else None),
                             "ts": ts,
-                        })
+                        }
+                        # Attach tool metadata for desktop frontend
+                        try:
+                            from tools.registry import registry
+                            tool_event["tool_emoji"] = registry.get_emoji(tool_name, "")
+                            tool_event["toolset"] = registry.get_toolset_for_tool(tool_name) or ""
+                            from acp_adapter.tools import get_tool_kind
+                            tool_event["tool_kind"] = get_tool_kind(tool_name)
+                        except Exception:
+                            pass
+                        events.append(tool_event)
                     # Keep turn open — tool results will follow
                 else:
                     # No tool calls — close turn immediately
@@ -781,6 +885,9 @@ class DesktopAdapter(BasePlatformAdapter):
             "clarify.response": self._handle_clarify_response,
             "turn.interrupt": self._handle_turn_interrupt,
             "model.switch": self._handle_model_switch,
+            "memory.read": self._handle_memory_read,
+            "memory.update": self._handle_memory_update,
+            "session.search": self._handle_session_search,
         }
         handler = handler_map.get(kind)
         if handler is None:
@@ -1105,6 +1212,118 @@ class DesktopAdapter(BasePlatformAdapter):
             )
 
     # ------------------------------------------------------------------
+    # Handlers — memory + session search
+    # ------------------------------------------------------------------
+
+    def _ensure_memory_store(self):
+        """Lazily initialise and return the shared MemoryStore instance."""
+        if self._memory_store is None:
+            try:
+                from tools.memory_tool import MemoryStore
+                self._memory_store = MemoryStore()
+                self._memory_store.load_from_disk()
+            except Exception as e:
+                logger.warning("[desktop] MemoryStore unavailable: %s", e)
+        return self._memory_store
+
+    async def _handle_memory_read(self, conn: _Connection, msg: dict) -> None:
+        store = self._ensure_memory_store()
+        if store is None:
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="MEMORY_UNAVAILABLE",
+                            message="MemoryStore not available")
+            return
+        store.load_from_disk()  # reload to pick up changes from turns
+        await self._send_memory_state(conn, msg)
+
+    async def _handle_memory_update(self, conn: _Connection, msg: dict) -> None:
+        store = self._ensure_memory_store()
+        if store is None:
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="MEMORY_UNAVAILABLE",
+                            message="MemoryStore not available")
+            return
+        action = msg.get("action", "")
+        target = msg.get("target", "memory")
+        if action not in ("add", "replace", "remove"):
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="PROTO_INVALID_FIELD",
+                            message=f"Invalid action: {action}")
+            return
+        if target not in ("memory", "user"):
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="PROTO_INVALID_FIELD",
+                            message=f"Invalid target: {target}")
+            return
+        try:
+            if action == "add":
+                result = store.add(target, msg.get("content", ""))
+            elif action == "replace":
+                result = store.replace(target, msg.get("old_text", ""), msg.get("new_text", ""))
+            else:
+                result = store.remove(target, msg.get("old_text", ""))
+            if not result.get("success"):
+                await conn.send("error", ref_id=msg.get("id"),
+                                code="MEMORY_UPDATE_FAILED",
+                                message=result.get("error", "Unknown error"))
+                return
+        except Exception as e:
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="MEMORY_UPDATE_FAILED",
+                            message=str(e)[:500])
+            return
+        await self._send_memory_state(conn, msg)
+
+    async def _send_memory_state(self, conn: _Connection, msg: dict) -> None:
+        """Send current memory state to the requesting connection."""
+        store = self._memory_store
+        mem = store._entries_for("memory")
+        usr = store._entries_for("user")
+        await conn.send(
+            "memory.state",
+            ref_id=msg.get("id"),
+            memory_entries=mem,
+            user_entries=usr,
+            memory_char_limit=store.memory_char_limit,
+            user_char_limit=store.user_char_limit,
+            memory_chars_used=store._char_count("memory"),
+            user_chars_used=store._char_count("user"),
+        )
+
+    async def _handle_session_search(self, conn: _Connection, msg: dict) -> None:
+        query = msg.get("query", "")
+        limit = min(msg.get("limit", 5), 5)
+        db = self._ensure_session_db()
+        if db is None:
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="DB_UNAVAILABLE",
+                            message="Session database not available")
+            return
+        try:
+            from tools.session_search_tool import session_search
+            result_json = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: session_search(query=query, limit=limit, db=db)
+            )
+            parsed = json.loads(result_json)
+            results = parsed.get("results", [])
+            await conn.send(
+                "session.search.ok",
+                ref_id=msg.get("id"),
+                results=[{
+                    "session_id": r.get("session_id", ""),
+                    "title": r.get("title", ""),
+                    "date": r.get("when", r.get("date", "")),
+                    "summary": r.get("summary", ""),
+                    "match_count": r.get("match_count", 0),
+                } for r in results],
+            )
+        except Exception as e:
+            logger.exception("[desktop] session.search error")
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="SEARCH_ERROR",
+                            message=str(e)[:500])
+
+    # ------------------------------------------------------------------
     # Handlers — prompt.send + agent runner
     # ------------------------------------------------------------------
 
@@ -1210,6 +1429,36 @@ class DesktopAdapter(BasePlatformAdapter):
                 }), loop
             )
 
+        # --- Tool output streaming ---
+        debouncer = _OutputDebouncer(self._broadcast_to_session, session_id, turn_id, loop)
+        active.debouncer = debouncer
+
+        def _on_tool_output(call_id, stream, text):
+            """Receive intermediate tool output (stdout/stderr/progress)."""
+            if not text:
+                return
+            debouncer.push(call_id, stream, text)
+
+        # --- Iteration progress ---
+        def _on_step(iteration, prev_tools):
+            """Receive iteration progress from agent loop."""
+            tool_summaries = [
+                {"name": t.get("name", "?"),
+                 "result": "error" if t.get("is_error") else
+                           "ok" if t.get("result") is not None else None}
+                for t in (prev_tools or [])
+            ]
+            asyncio.run_coroutine_threadsafe(
+                self._broadcast_to_session(session_id, {
+                    "kind": "turn.progress",
+                    "turn_id": turn_id,
+                    "iteration": iteration,
+                    "max_iterations": 90,  # updated after agent creation
+                    "status": "calling model",
+                    "prev_tools": tool_summaries,
+                }), loop
+            )
+
         # Auto-generate call_id for tool events since upstream AIAgent
         # doesn't provide one. Tracks current tool_name → call_id mapping
         # so tool.completed can reference the same id as tool.started.
@@ -1225,13 +1474,31 @@ class DesktopAdapter(BasePlatformAdapter):
                 env = {"kind": "tool.started", "turn_id": turn_id,
                        "call_id": call_id, "tool": tool_name,
                        "preview": preview, "args": args}
+                # Attach tool metadata for desktop frontend
+                try:
+                    from tools.registry import registry
+                    env["tool_emoji"] = registry.get_emoji(tool_name or "", "")
+                    env["toolset"] = registry.get_toolset_for_tool(tool_name or "") or ""
+                    from acp_adapter.tools import get_tool_kind
+                    env["tool_kind"] = get_tool_kind(tool_name or "")
+                except Exception:
+                    pass  # Don't break tool execution if metadata lookup fails
             elif event_type == "tool.completed":
                 call_id = kw.get("call_id") or _active_tool_calls.pop(tool_name or "", f"call-{turn_id[-8:]}-0")
-                env = {"kind": "tool.completed", "turn_id": turn_id,
-                       "call_id": call_id, "tool": tool_name,
-                       "duration": round(kw.get("duration", 0), 3),
-                       "error": kw.get("is_error", False),
-                       "output_preview": kw.get("output_preview")}
+                # Combined coroutine: flush remaining output, THEN broadcast completed.
+                # Using a single coroutine guarantees ordering — the flush awaits
+                # before the completed envelope is sent to subscribers.
+                async def _flush_then_complete(_cid=call_id, _tn=tool_name, _kw=kw):
+                    await debouncer.flush_all(_cid)
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "tool.completed", "turn_id": turn_id,
+                        "call_id": _cid, "tool": _tn,
+                        "duration": round(_kw.get("duration", 0), 3),
+                        "error": _kw.get("is_error", False),
+                        "output_preview": _kw.get("output_preview"),
+                    })
+                asyncio.run_coroutine_threadsafe(_flush_then_complete(), loop)
+                return  # Skip default broadcast — handled above
             elif event_type == "reasoning.available":
                 # SKIP — upstream sends assistant_message.content (the response
                 # text) as "reasoning.available", which is wrong for our use case.
@@ -1267,6 +1534,8 @@ class DesktopAdapter(BasePlatformAdapter):
             tool_progress_callback=_on_tool_progress,
             reasoning_callback=_on_reasoning,
             clarify_callback=self._make_clarify_callback(session_id, turn_id, loop),
+            tool_output_callback=_on_tool_output,
+            step_callback=_on_step,
             model_override=model_override,
         )
         active.agent = agent
@@ -1292,6 +1561,8 @@ class DesktopAdapter(BasePlatformAdapter):
                                 reasoning_callback=None,
                                 clarify_callback=None,
                                 ephemeral_system_prompt=None,
+                                tool_output_callback=None,
+                                step_callback=None,
                                 model_override=None):
         """Create an AIAgent instance — mirrors api_server.py:404 pattern.
 
@@ -1376,6 +1647,8 @@ class DesktopAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
+            tool_output_callback=tool_output_callback,
+            step_callback=step_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -1498,6 +1771,10 @@ class DesktopAdapter(BasePlatformAdapter):
                     "completion_tokens": getattr(active.agent, "session_completion_tokens", 0) or 0,
                     "model": getattr(active.agent, "model", "unknown"),
                 }
+                # Cancel debouncer before broadcasting turn.complete to prevent
+                # stale output deltas from arriving after the turn has ended.
+                if active.debouncer:
+                    active.debouncer.cancel_all()
                 await self._broadcast_to_session(session_id, {
                     "kind": "turn.complete", "turn_id": turn_id, "usage": usage,
                 })
@@ -1511,6 +1788,8 @@ class DesktopAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 logger.exception("[desktop] turn %s failed", turn_id)
+                if active.debouncer:
+                    active.debouncer.cancel_all()
                 await self._broadcast_to_session(session_id, {
                     "kind": "turn.error", "turn_id": turn_id,
                     "code": "AGENT_EXCEPTION", "message": str(exc)[:500],
@@ -1668,22 +1947,32 @@ class DesktopAdapter(BasePlatformAdapter):
     async def _handle_turn_interrupt(self, conn: _Connection, msg: dict) -> None:
         session_id = msg.get("session_id", "")
         active = self._active_turns.get(session_id)
-        if active and active.agent:
-            try:
-                active.agent.interrupt("user interrupt")
-            except Exception:
-                pass
+        if active:
+            if active.debouncer:
+                active.debouncer.cancel_all()
+            if active.agent:
+                try:
+                    active.agent.interrupt("user interrupt")
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Broadcast
     # ------------------------------------------------------------------
 
-    async def _broadcast_to_session(self, session_id: str, envelope: dict) -> None:
-        """Fan-out one envelope to every subscriber of a session."""
-        buf = self._session_buffers[session_id]
-        # Stamp envelope with standard fields before buffering for replay
+    async def _broadcast_to_session(
+        self, session_id: str, envelope: dict, *, skip_buffer: bool = False
+    ) -> None:
+        """Fan-out one envelope to every subscriber of a session.
+
+        Args:
+            skip_buffer: If True, skip ring buffer write. Used for
+                ephemeral envelopes like tool.output.delta.
+        """
         stamped = {"v": 1, "ts": time.time(), **envelope}
-        buf.append(stamped)
+        if not skip_buffer:
+            buf = self._session_buffers[session_id]
+            buf.append(stamped)
 
         for conn_id in list(self._session_subscribers.get(session_id, ())):
             conn = self._connections.get(conn_id)
