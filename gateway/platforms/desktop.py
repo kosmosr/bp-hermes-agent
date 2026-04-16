@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -83,6 +84,8 @@ class _ActiveTurn:
     task: Optional[asyncio.Task] = None
     session_key: str = ""
     debouncer: Optional[_OutputDebouncer] = None
+    workflow_engine: Any = None  # WorkflowEngine instance for workflow mode
+    mentions: Optional[dict] = None  # role_id → mention dict for AI-driven delegation
 
 
 # ANSI escape sequence pattern — comprehensive 7-bit C1 catch-all.
@@ -441,10 +444,96 @@ class DesktopAdapter(BasePlatformAdapter):
                             working_dir TEXT NOT NULL
                         )"""
                     )
+                    conn.execute(
+                        """CREATE TABLE IF NOT EXISTS delegation_log (
+                            session_id TEXT NOT NULL,
+                            turn_id TEXT NOT NULL,
+                            call_id TEXT NOT NULL,
+                            team_id TEXT,
+                            role_id TEXT,
+                            role_name TEXT,
+                            goal TEXT,
+                            source TEXT DEFAULT 'ai',
+                            duration REAL DEFAULT 0,
+                            error INTEGER DEFAULT 0,
+                            output_preview TEXT,
+                            created_at REAL NOT NULL,
+                            PRIMARY KEY (session_id, turn_id, call_id)
+                        )"""
+                    )
+                    conn.execute(
+                        """CREATE INDEX IF NOT EXISTS idx_delegation_log_team
+                           ON delegation_log (team_id, created_at)"""
+                    )
+                    conn.execute(
+                        """CREATE INDEX IF NOT EXISTS idx_delegation_log_session
+                           ON delegation_log (session_id, created_at)"""
+                    )
                 self._session_db._execute_write(_create_meta_table)
             except Exception as e:
                 logger.debug("SessionDB unavailable for desktop: %s", e)
         return self._session_db
+
+    def _build_mentions_prompt(self, mentions):
+        """Build system prompt describing available team roles for AI-driven delegation."""
+        lines = [
+            "# Available Team Roles",
+            "Delegate tasks to these roles using the delegate_task tool.",
+            "CRITICAL: When calling delegate_task, you MUST include 'role_id:<id>' "
+            "on the FIRST LINE of the `context` parameter so the system can track "
+            "which role is executing.",
+            "",
+        ]
+        for m in mentions:
+            role_name = m.get("role_name", "Agent")
+            role_id = m.get("role_id", "")
+            ts = m.get("toolsets") or []
+            sk = m.get("skills") or []
+            mi = m.get("max_iterations", 30)
+            lines.append(f"## {role_name}")
+            lines.append(f"- role_id: {role_id}")
+            if m.get("role_prompt"):
+                lines.append(f"- System prompt: {m['role_prompt']}")
+            if ts:
+                lines.append(f"- toolsets: {json.dumps(ts)}")
+            if sk:
+                lines.append(f"- skills: {json.dumps(sk)}")
+            lines.append(f"- max_iterations: {mi}")
+            lines.append("")
+            lines.append(f"Example delegate_task call for {role_name}:")
+            lines.append(f'  delegate_task(goal="<task>", '
+                         f'context="role_id:{role_id}\\n<additional context>", '
+                         f'toolsets={json.dumps(ts)}, '
+                         f'max_iterations={mi})')
+            lines.append("")
+        return "\n".join(lines)
+
+    def _write_delegation_log(self, session_id, turn_id, call_id,
+                               duration=0, error=False, output_preview=None,
+                               team_id=None, role_id=None, role_name=None,
+                               goal=None, source="ai"):
+        """Write a delegation completion record to the delegation_log table."""
+        db = self._ensure_session_db()
+        if not db:
+            return
+        try:
+            import time as _time
+            def _insert(conn):
+                conn.execute(
+                    """INSERT OR REPLACE INTO delegation_log
+                       (session_id, turn_id, call_id, team_id, role_id,
+                        role_name, goal, source, duration, error,
+                        output_preview, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, turn_id, call_id, team_id, role_id,
+                     role_name, goal, source, duration,
+                     1 if error else 0,
+                     (output_preview or "")[:500],
+                     _time.time()),
+                )
+            db._execute_write(_insert)
+        except Exception as e:
+            logger.debug("Failed to write delegation_log: %s", e)
 
     def _load_sessions_from_db(self):
         """Seed _known_sessions from SessionDB (SQLite) for history persistence."""
@@ -779,48 +868,7 @@ class DesktopAdapter(BasePlatformAdapter):
 
             welcome_models = {}
             try:
-                from hermes_cli.model_switch import list_authenticated_providers
-                from gateway.run import _load_gateway_config, _resolve_gateway_model
-                cfg = _load_gateway_config()
-                model_cfg = cfg.get("model", {})
-                current_provider = model_cfg.get("provider", "openrouter") if isinstance(model_cfg, dict) else "openrouter"
-                current_model = _resolve_gateway_model(cfg)
-
-                # For custom/local providers, query the endpoint's /models API
-                # instead of relying on models.dev (which doesn't know about proxies).
-                _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
-                if current_provider in _LOCAL_PROVIDERS:
-                    base_url = (model_cfg.get("base_url", "")
-                                if isinstance(model_cfg, dict) else "")
-                    api_key = (model_cfg.get("api_key", "")
-                               if isinstance(model_cfg, dict) else "")
-                    if not api_key:
-                        # Try common env vars
-                        api_key = (os.environ.get("OPENAI_API_KEY")
-                                   or os.environ.get("ANTHROPIC_API_KEY")
-                                   or os.environ.get("API_KEY") or "")
-                    proxy_models = await self._fetch_endpoint_models(base_url, api_key)
-                    providers = [{
-                        "slug": current_provider,
-                        "name": current_provider.title(),
-                        "is_current": True,
-                        "is_user_defined": True,
-                        "models": proxy_models if proxy_models else [current_model],
-                        "total_models": len(proxy_models) if proxy_models else 1,
-                        "source": "endpoint",
-                    }]
-                else:
-                    providers = list_authenticated_providers(
-                        current_provider=current_provider,
-                        user_providers=cfg.get("providers"),
-                        max_models=20,
-                    )
-
-                welcome_models = {
-                    "providers": providers,
-                    "current_model": current_model,
-                    "current_provider": current_provider,
-                }
+                welcome_models = await self._build_models_payload()
             except Exception:
                 logger.debug("[desktop] could not load model catalog for welcome")
 
@@ -896,6 +944,13 @@ class DesktopAdapter(BasePlatformAdapter):
             "memory.read": self._handle_memory_read,
             "memory.update": self._handle_memory_update,
             "session.search": self._handle_session_search,
+            "team.stats": self._handle_team_stats,
+            "config.get": self._handle_config_get,
+            "config.set-default-model": self._handle_config_set_default_model,
+            "config.set-credential": self._handle_config_set_credential,
+            "config.set-endpoint": self._handle_config_set_endpoint,
+            "config.delete-endpoint": self._handle_config_delete_endpoint,
+            "config.update": self._handle_config_update,
         }
         handler = handler_map.get(kind)
         if handler is None:
@@ -1331,6 +1386,67 @@ class DesktopAdapter(BasePlatformAdapter):
                             code="SEARCH_ERROR",
                             message=str(e)[:500])
 
+    async def _handle_team_stats(self, conn: _Connection, msg: dict) -> None:
+        """Query delegation_log for team statistics within a date range."""
+        team_id = msg.get("team_id")  # optional — None means all teams
+        start = msg.get("start")      # epoch float, optional
+        end = msg.get("end")          # epoch float, optional
+        db = self._ensure_session_db()
+        if db is None:
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="DB_UNAVAILABLE",
+                            message="Session database not available")
+            return
+        try:
+            def _query():
+                clauses = []
+                params = []
+                if team_id:
+                    clauses.append("team_id = ?")
+                    params.append(team_id)
+                if start:
+                    clauses.append("created_at >= ?")
+                    params.append(float(start))
+                if end:
+                    clauses.append("created_at <= ?")
+                    params.append(float(end))
+                where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+                with db._lock:
+                    cursor = db._conn.execute(
+                        f"""SELECT session_id, turn_id, call_id, team_id,
+                                   role_id, role_name, goal, source,
+                                   duration, error, output_preview, created_at
+                            FROM delegation_log{where}
+                            ORDER BY created_at DESC LIMIT 200""",
+                        params,
+                    )
+                    cols = [d[0] for d in cursor.description]
+                    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+            results = await asyncio.get_event_loop().run_in_executor(
+                None, _query
+            )
+            # Compute summary stats
+            total = len(results)
+            errors = sum(1 for r in results if r.get("error"))
+            total_duration = sum(r.get("duration", 0) for r in results)
+            await conn.send(
+                "team.stats.ok",
+                ref_id=msg.get("id"),
+                stats={
+                    "total": total,
+                    "errors": errors,
+                    "total_duration": round(total_duration, 2),
+                    "avg_duration": round(total_duration / total, 2) if total else 0,
+                },
+                entries=results[:100],  # cap response size
+            )
+        except Exception as e:
+            logger.exception("[desktop] team.stats error")
+            await conn.send("error", ref_id=msg.get("id"),
+                            code="TEAM_STATS_ERROR",
+                            message=str(e)[:500])
+
     # ------------------------------------------------------------------
     # Handlers — prompt.send + agent runner
     # ------------------------------------------------------------------
@@ -1420,6 +1536,16 @@ class DesktopAdapter(BasePlatformAdapter):
 
         turn_id = f"turn-{uuid.uuid4().hex[:12]}"
         session_key = f"desktop:{session_id}"
+
+        # D36: explicit rejection if both workflow and mentions are present
+        workflow = msg.get("workflow")
+        mentions = msg.get("mentions")
+        team_id = msg.get("team_id")
+        if workflow and mentions:
+            await conn.send("error", code="PROTO_CONFLICT", ref_id=msg.get("id"),
+                            message="Cannot combine workflow and mentions in same prompt.send")
+            return
+
         active = _ActiveTurn(
             turn_id=turn_id, session_id=session_id,
             initiator_conn_id=conn.id, session_key=session_key,
@@ -1472,9 +1598,122 @@ class DesktopAdapter(BasePlatformAdapter):
         # so tool.completed can reference the same id as tool.started.
         _tool_call_seq = 0
         _active_tool_calls: dict[str, str] = {}  # tool_name → call_id
+        _delegation_meta: dict[str, dict] = {}   # call_id → {role_id, role_name, goal}
 
         def _on_tool_progress(event_type, tool_name=None, preview=None, args=None, **kw):
             nonlocal _tool_call_seq
+
+            # ── Delegation interception ──
+            # Detect delegate_task tool calls and emit delegation-specific
+            # envelopes so the desktop client can render DelegationCard UI.
+            if event_type == "delegation.progress":
+                # Relayed from child agent's step_callback via
+                # _build_child_progress_callback._step_cb
+                env = {
+                    "kind": "delegation.progress",
+                    "turn_id": turn_id,
+                    "iteration": kw.get("iteration", 0),
+                    "prev_tools": kw.get("prev_tools", []),
+                    "task_index": kw.get("task_index", 0),
+                }
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_to_session(session_id, env, skip_buffer=True), loop
+                )
+                return
+
+            if tool_name == "delegate_task" and event_type == "tool.started":
+                _tool_call_seq += 1
+                call_id = kw.get("call_id") or f"call-{turn_id[-8:]}-{_tool_call_seq}"
+                _active_tool_calls[tool_name] = call_id
+                # Extract role_id from context parameter (AI instructed to include it)
+                role_id = None
+                role_name = None
+                if args and isinstance(args, dict):
+                    context_str = args.get("context") or ""
+                    if isinstance(context_str, str):
+                        for line in context_str.split("\n")[:3]:
+                            stripped = line.strip()
+                            if stripped.startswith("role_id:"):
+                                role_id = stripped[8:].strip()
+                                break
+                    # Fallback: direct field (for workflow mode or future use)
+                    if not role_id:
+                        role_id = args.get("_role_id")
+                # Lookup role_name from stored mentions
+                if role_id and active.mentions:
+                    mention = active.mentions.get(role_id)
+                    if mention:
+                        role_name = mention.get("role_name")
+                env = {
+                    "kind": "delegation.started",
+                    "turn_id": turn_id,
+                    "call_id": call_id,
+                    "source": "ai",
+                    "goal": (args or {}).get("goal", ""),
+                    "role_id": role_id,
+                    "role_name": role_name,
+                    "model": (args or {}).get("model"),
+                }
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_to_session(session_id, env), loop
+                )
+                # Cache metadata for completion handler (args is None at tool.completed)
+                _delegation_meta[call_id] = {
+                    "role_id": role_id, "role_name": role_name,
+                    "goal": (args or {}).get("goal", ""),
+                }
+                # Also emit standard tool.started for ToolCard tracking
+                env_tool = {"kind": "tool.started", "turn_id": turn_id,
+                            "call_id": call_id, "tool": tool_name,
+                            "preview": preview, "args": args}
+                asyncio.run_coroutine_threadsafe(
+                    self._broadcast_to_session(session_id, env_tool), loop
+                )
+                return
+
+            if tool_name == "delegate_task" and event_type == "tool.completed":
+                call_id = kw.get("call_id") or _active_tool_calls.pop(tool_name, f"call-{turn_id[-8:]}-0")
+                duration = round(kw.get("duration", 0), 3)
+                is_error = kw.get("is_error", False)
+                output_preview = kw.get("output_preview")
+                # Lookup metadata cached at delegation.started (args is None at completion)
+                meta = _delegation_meta.pop(call_id, {})
+                _del_role_id = meta.get("role_id")
+                _del_role_name = meta.get("role_name")
+                _del_goal = meta.get("goal", "")
+                # Write to delegation log with team context
+                self._write_delegation_log(
+                    session_id=session_id, turn_id=turn_id,
+                    call_id=call_id, duration=duration,
+                    error=is_error, output_preview=output_preview,
+                    team_id=team_id,
+                    role_id=_del_role_id,
+                    role_name=_del_role_name,
+                    goal=_del_goal,
+                    source="ai",
+                )
+
+                async def _flush_then_complete_delegation(_cid=call_id, _dur=duration, _err=is_error, _op=output_preview,
+                                                          _rid=_del_role_id, _rn=_del_role_name):
+                    await debouncer.flush_all(_cid)
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "delegation.completed", "turn_id": turn_id,
+                        "call_id": _cid, "source": "ai",
+                        "duration": _dur, "error": _err,
+                        "output_preview": _op,
+                        "role_id": _rid, "role_name": _rn,
+                    })
+                    # Also emit standard tool.completed
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "tool.completed", "turn_id": turn_id,
+                        "call_id": _cid, "tool": "delegate_task",
+                        "duration": _dur, "error": _err,
+                        "output_preview": _op,
+                    })
+                asyncio.run_coroutine_threadsafe(_flush_then_complete_delegation(), loop)
+                return
+
+            # ── Standard tool handling ──
             if event_type == "tool.started":
                 _tool_call_seq += 1
                 call_id = kw.get("call_id") or f"call-{turn_id[-8:]}-{_tool_call_seq}"
@@ -1536,18 +1775,6 @@ class DesktopAdapter(BasePlatformAdapter):
         if session_working_dir:
             os.environ["TERMINAL_CWD"] = session_working_dir
 
-        agent = self._create_agent_for_turn(
-            session_id=session_id,
-            stream_delta_callback=_on_delta,
-            tool_progress_callback=_on_tool_progress,
-            reasoning_callback=_on_reasoning,
-            clarify_callback=self._make_clarify_callback(session_id, turn_id, loop),
-            tool_output_callback=_on_tool_output,
-            step_callback=_on_step,
-            model_override=model_override,
-        )
-        active.agent = agent
-
         # Store user message in ring buffer so snapshot replay includes it
         await self._broadcast_to_session(session_id, {
             "kind": "user.message", "session_id": session_id,
@@ -1557,6 +1784,66 @@ class DesktopAdapter(BasePlatformAdapter):
         await self._broadcast_to_session(session_id, {
             "kind": "turn.started", "session_id": session_id, "turn_id": turn_id,
         })
+
+        # === WORKFLOW MODE: deterministic DAG execution ===
+        if workflow:
+            from gateway.platforms.workflow_engine import WorkflowEngine
+            engine = WorkflowEngine(self, session_id, turn_id, loop, team_id=team_id)
+            active.workflow_engine = engine
+
+            async def _run_workflow():
+                try:
+                    results = await engine.execute(workflow, content)
+                    # Synthesize summary from step outputs
+                    summary_parts = [
+                        f"**{sid}**: {text[:100]}..."
+                        for sid, text in results.items()
+                        if not text.startswith("Error:")
+                    ]
+                    summary = "Workflow completed.\n\n" + "\n".join(summary_parts)
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "message.delta", "turn_id": turn_id, "text": summary,
+                    })
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "turn.complete", "turn_id": turn_id,
+                        "session_id": session_id,
+                        "usage": engine._usage_totals,
+                    })
+                except Exception as e:
+                    logger.exception("[desktop] workflow error session=%s", session_id)
+                    await self._broadcast_to_session(session_id, {
+                        "kind": "turn.error", "turn_id": turn_id,
+                        "session_id": session_id,
+                        "code": "WORKFLOW_ERROR", "message": str(e),
+                    })
+                finally:
+                    self._active_turns.pop(session_id, None)
+
+            active.task = asyncio.create_task(_run_workflow())
+            logger.info("[desktop] workflow.send session=%s turn=%s steps=%d",
+                        session_id, turn_id, len(workflow.get("steps", [])))
+            return
+
+        # === AI-DRIVEN MODE ===
+        ephemeral_prompt = None
+        if mentions:
+            ephemeral_prompt = self._build_mentions_prompt(mentions)
+            active.mentions = {
+                m.get("role_id", ""): m for m in mentions if m.get("role_id")
+            }
+
+        agent = self._create_agent_for_turn(
+            session_id=session_id,
+            stream_delta_callback=_on_delta,
+            tool_progress_callback=_on_tool_progress,
+            reasoning_callback=_on_reasoning,
+            clarify_callback=self._make_clarify_callback(session_id, turn_id, loop),
+            tool_output_callback=_on_tool_output,
+            step_callback=_on_step,
+            model_override=model_override,
+            ephemeral_system_prompt=ephemeral_prompt,
+        )
+        active.agent = agent
 
         active.task = asyncio.create_task(
             self._run_agent_async(active, user_message=content)
@@ -1958,6 +2245,12 @@ class DesktopAdapter(BasePlatformAdapter):
         if active:
             if active.debouncer:
                 active.debouncer.cancel_all()
+            # Workflow mode: cancel the engine (interrupts all step agents)
+            if active.workflow_engine:
+                try:
+                    active.workflow_engine.cancel()
+                except Exception:
+                    pass
             if active.agent:
                 try:
                     active.agent.interrupt("user interrupt")
@@ -1996,3 +2289,620 @@ class DesktopAdapter(BasePlatformAdapter):
                 self._session_subscribers[session_id].discard(conn_id)
             except Exception as e:
                 logger.warning("[desktop] broadcast to %s failed: %s", conn_id[:8], e)
+
+    # ------------------------------------------------------------------
+    # Handlers — config management
+    # ------------------------------------------------------------------
+
+    _BUILTIN_PROVIDERS = [
+        {"slug": "anthropic", "name": "Anthropic", "env_var": "ANTHROPIC_API_KEY", "group": "international"},
+        {"slug": "openai", "name": "OpenAI", "env_var": "OPENAI_API_KEY", "group": "international"},
+        {"slug": "gemini", "name": "Google / Gemini", "env_var": "GOOGLE_API_KEY", "group": "international"},
+        {"slug": "openrouter", "name": "OpenRouter", "env_var": "OPENROUTER_API_KEY", "group": "international"},
+        {"slug": "deepseek", "name": "DeepSeek", "env_var": "DEEPSEEK_API_KEY", "group": "international"},
+        {"slug": "huggingface", "name": "Hugging Face", "env_var": "HF_TOKEN", "group": "international"},
+        {"slug": "zai", "name": "z.ai / GLM", "env_var": "GLM_API_KEY", "group": "china"},
+        {"slug": "kimi-coding", "name": "Kimi (国际)", "env_var": "KIMI_API_KEY", "group": "china"},
+        {"slug": "kimi-coding-cn", "name": "Kimi (国内)", "env_var": "KIMI_CN_API_KEY", "group": "china"},
+        {"slug": "minimax", "name": "MiniMax (国际)", "env_var": "MINIMAX_API_KEY", "group": "china"},
+        {"slug": "minimax-cn", "name": "MiniMax (国内)", "env_var": "MINIMAX_CN_API_KEY", "group": "china"},
+        {"slug": "alibaba", "name": "阿里 / DashScope", "env_var": "DASHSCOPE_API_KEY", "group": "china"},
+        {"slug": "xiaomi", "name": "小米 / MiMo", "env_var": "XIAOMI_API_KEY", "group": "china"},
+        {"slug": "arcee", "name": "Arcee", "env_var": "ARCEEAI_API_KEY", "group": "other"},
+        {"slug": "kilocode", "name": "KiloCode", "env_var": "KILOCODE_API_KEY", "group": "other"},
+        {"slug": "opencode-zen", "name": "OpenCode Zen", "env_var": "OPENCODE_ZEN_API_KEY", "group": "other"},
+        {"slug": "opencode-go", "name": "OpenCode Go", "env_var": "OPENCODE_GO_API_KEY", "group": "other"},
+        {"slug": "ai-gateway", "name": "AI Gateway", "env_var": "AI_GATEWAY_API_KEY", "group": "other"},
+        {"slug": "nous", "name": "Nous", "env_var": "", "group": "other"},
+    ]
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        """Mask an API key, preserving prefix and last 4 chars."""
+        if not key or len(key) <= 8:
+            return "***"
+        try:
+            first = key.index("-")
+            second = key.index("-", first + 1)
+            prefix_end = second + 1
+        except ValueError:
+            prefix_end = 4
+        return key[:prefix_end] + "***" + key[-4:]
+
+    async def _build_models_payload(self) -> dict:
+        """Build models info dict (same logic as welcome envelope)."""
+        try:
+            from hermes_cli.model_switch import list_authenticated_providers
+            from gateway.run import _load_gateway_config, _resolve_gateway_model
+
+            # Reload .env so freshly-written credentials are visible
+            _env_path = Path.home() / ".hermes" / ".env"
+            if _env_path.exists():
+                from dotenv import load_dotenv
+                try:
+                    load_dotenv(str(_env_path), override=True, encoding="utf-8")
+                except UnicodeDecodeError:
+                    load_dotenv(str(_env_path), override=True, encoding="latin-1")
+                except Exception:
+                    pass
+
+            cfg = _load_gateway_config()
+            model_cfg = cfg.get("model", {})
+            current_provider = model_cfg.get("provider", "openrouter") if isinstance(model_cfg, dict) else "openrouter"
+            current_model = _resolve_gateway_model(cfg)
+
+            _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
+            if current_provider in _LOCAL_PROVIDERS:
+                base_url = (model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else "")
+                api_key = (model_cfg.get("api_key", "") if isinstance(model_cfg, dict) else "")
+                if not api_key:
+                    api_key = (os.environ.get("OPENAI_API_KEY")
+                               or os.environ.get("ANTHROPIC_API_KEY")
+                               or os.environ.get("API_KEY") or "")
+                proxy_models = await self._fetch_endpoint_models(base_url, api_key)
+                providers = [{
+                    "slug": current_provider,
+                    "name": current_provider.title(),
+                    "is_current": True,
+                    "is_user_defined": True,
+                    "models": proxy_models if proxy_models else [current_model],
+                    "total_models": len(proxy_models) if proxy_models else 1,
+                    "source": "endpoint",
+                }]
+            else:
+                providers = list_authenticated_providers(
+                    current_provider=current_provider,
+                    user_providers=cfg.get("providers"),
+                    max_models=20,
+                )
+
+                # Ensure the current provider always appears in the list even
+                # if list_authenticated_providers missed it (e.g. models.dev
+                # data unavailable or env var not detected).
+                if not any(p["slug"] == current_provider for p in providers):
+                    from hermes_cli.models import _PROVIDER_MODELS
+                    from hermes_cli.providers import get_label
+                    curated = list(_PROVIDER_MODELS.get(current_provider, []))
+                    providers.insert(0, {
+                        "slug": current_provider,
+                        "name": get_label(current_provider),
+                        "is_current": True,
+                        "is_user_defined": False,
+                        "models": curated[:20] if curated else [current_model],
+                        "total_models": len(curated) if curated else 1,
+                        "source": "fallback",
+                    })
+
+            return {
+                "providers": providers,
+                "current_model": current_model,
+                "current_provider": current_provider,
+            }
+        except Exception:
+            logger.debug("[desktop] could not build models payload")
+            return {}
+
+    @staticmethod
+    def _slugify(name: str) -> str:
+        """Derive a URL-safe slug from a display name."""
+        return name.lower().replace(" ", "-")
+
+    async def _handle_config_get(self, conn: _Connection, msg: dict) -> None:
+        """Return full config snapshot: default model, provider credentials, custom endpoints."""
+        from dotenv import dotenv_values
+
+        hermes_dir = Path.home() / ".hermes"
+        config_path = hermes_dir / "config.yaml"
+        env_path = hermes_dir / ".env"
+
+        try:
+            config: dict = {}
+            if config_path.exists():
+                import yaml
+                with open(config_path) as f:
+                    fcntl.flock(f, fcntl.LOCK_SH)
+                    try:
+                        config = yaml.safe_load(f) or {}
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
+
+            model_cfg = config.get("model", {})
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            default_model = model_cfg.get("default", "")
+            default_provider = model_cfg.get("provider", "")
+            model_base_url = model_cfg.get("base_url") or None
+            model_api_mode = model_cfg.get("api_mode") or None
+            _raw_ctx = model_cfg.get("context_length")
+            model_context_length = int(_raw_ctx) if _raw_ctx is not None else None
+
+            env_vars = dotenv_values(str(env_path)) if env_path.exists() else {}
+
+            providers = []
+            for bp in self._BUILTIN_PROVIDERS:
+                key_val = env_vars.get(bp["env_var"], "") if bp["env_var"] else ""
+                providers.append({
+                    "slug": bp["slug"],
+                    "name": bp["name"],
+                    "credential_status": "configured" if key_val else "missing",
+                    "credential_hint": self._mask_key(key_val) if key_val else None,
+                    "is_builtin": True,
+                    "group": bp["group"],
+                })
+
+            custom_endpoints = []
+            for cp in config.get("custom_providers", []):
+                cp_name = cp.get("name", "")
+                custom_endpoints.append({
+                    "slug": self._slugify(cp_name) if cp_name else "",
+                    "name": cp_name,
+                    "base_url": cp.get("base_url", ""),
+                    "default_model": cp.get("default_model", ""),
+                    "api_key_configured": bool(cp.get("api_key")),
+                    "api_mode": cp.get("api_mode", "chat_completions"),
+                    "context_length": cp.get("context_length"),
+                })
+
+            # --- Agent settings ---
+            agent_cfg = config.get("agent", {})
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+
+            # --- Memory settings ---
+            memory_cfg = config.get("memory", {})
+            if not isinstance(memory_cfg, dict):
+                memory_cfg = {}
+
+            # --- Compression settings ---
+            compression_cfg = config.get("compression", {})
+            if not isinstance(compression_cfg, dict):
+                compression_cfg = {}
+
+            # --- Approvals ---
+            approvals_cfg = config.get("approvals", {})
+            if not isinstance(approvals_cfg, dict):
+                approvals_cfg = {}
+
+            # --- Display ---
+            display_cfg = config.get("display", {})
+            if not isinstance(display_cfg, dict):
+                display_cfg = {}
+
+            # --- Security ---
+            security_cfg = config.get("security", {})
+            if not isinstance(security_cfg, dict):
+                security_cfg = {}
+
+            _tool_progress = display_cfg.get("tool_progress")
+            if _tool_progress is None:
+                _tool_progress = "all"
+
+            await conn.send("config.state",
+                             ref_id=msg.get("id"),
+                             default_model=default_model,
+                             default_provider=default_provider,
+                             providers=providers,
+                             custom_endpoints=custom_endpoints,
+                             model_base_url=model_base_url,
+                             model_api_mode=model_api_mode,
+                             model_context_length=model_context_length,
+                             # Agent
+                             agent_max_turns=agent_cfg.get("max_turns", 90),
+                             agent_reasoning_effort=agent_cfg.get("reasoning_effort", ""),
+                             agent_tool_use_enforcement=str(agent_cfg.get("tool_use_enforcement", "auto")),
+                             # Memory
+                             memory_enabled=memory_cfg.get("memory_enabled", True),
+                             memory_user_profile_enabled=memory_cfg.get("user_profile_enabled", True),
+                             memory_char_limit=memory_cfg.get("memory_char_limit", 2200),
+                             memory_user_char_limit=memory_cfg.get("user_char_limit", 1375),
+                             # Compression
+                             compression_enabled=compression_cfg.get("enabled", True),
+                             compression_threshold=compression_cfg.get("threshold", 0.50),
+                             compression_target_ratio=compression_cfg.get("target_ratio", 0.20),
+                             compression_protect_last_n=compression_cfg.get("protect_last_n", 20),
+                             # Safety
+                             approvals_mode=approvals_cfg.get("mode", "manual"),
+                             file_read_max_chars=config.get("file_read_max_chars", 100000),
+                             security_redact_secrets=security_cfg.get("redact_secrets", True),
+                             # Display
+                             display_show_reasoning=display_cfg.get("show_reasoning", False),
+                             display_show_cost=display_cfg.get("show_cost", False),
+                             display_tool_progress=_tool_progress,
+                             display_compact=display_cfg.get("compact", False),
+                             display_streaming=display_cfg.get("streaming", False),
+                             )
+        except Exception as exc:
+            logger.exception("[desktop] config.get error")
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="get",
+                            code="CONFIG_READ_FAILED",
+                            message=str(exc)[:500])
+
+    async def _handle_config_set_default_model(self, conn: _Connection, msg: dict) -> None:
+        """Update default model in config.yaml."""
+        model_id = msg.get("model_id", "")
+        provider_slug = msg.get("provider_slug", "")
+        if not model_id or not provider_slug:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-default-model",
+                            code="INVALID_MODEL",
+                            message="model_id and provider_slug are required")
+            return
+
+        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        import yaml
+
+        try:
+            with open(config_path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    config = yaml.safe_load(f) or {}
+                    if "model" not in config:
+                        config["model"] = {}
+
+                    # Auto-backup: if switching away from "custom" with a base_url,
+                    # save the current config to custom_providers so it can be restored
+                    old_model_cfg = config.get("model", {})
+                    old_provider = old_model_cfg.get("provider", "")
+                    old_base_url = old_model_cfg.get("base_url", "")
+                    if old_provider == "custom" and old_base_url and provider_slug != "custom":
+                        existing = config.get("custom_providers", [])
+                        has_match = any(cp.get("base_url") == old_base_url for cp in existing)
+                        if not has_match:
+                            from urllib.parse import urlparse as _urlparse
+                            _host = _urlparse(old_base_url).hostname or "custom"
+                            auto_entry = {
+                                "name": f"Auto-saved ({_host})",
+                                "base_url": old_base_url,
+                                "default_model": old_model_cfg.get("default", ""),
+                                "api_mode": old_model_cfg.get("api_mode", "chat_completions"),
+                            }
+                            if old_model_cfg.get("context_length"):
+                                auto_entry["context_length"] = old_model_cfg["context_length"]
+                            if "custom_providers" not in config:
+                                config["custom_providers"] = []
+                            config["custom_providers"].append(auto_entry)
+                            logger.info("[desktop] auto-saved custom provider config: %s", old_base_url)
+
+                    config["model"]["default"] = model_id
+                    config["model"]["provider"] = provider_slug
+                    # Optional override fields — present means write/clear, absent means leave untouched
+                    if "base_url" in msg:
+                        val = (msg["base_url"] or "").strip()
+                        if val:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(val)
+                            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                                await conn.send("config.error", ref_id=msg.get("id"),
+                                                action="set-default-model",
+                                                code="INVALID_URL",
+                                                message="Base URL must be a valid HTTP(S) address")
+                                return
+                            config["model"]["base_url"] = val
+                        else:
+                            config["model"].pop("base_url", None)
+                    if "api_mode" in msg:
+                        val = (msg["api_mode"] or "").strip()
+                        if val and val in ("chat_completions", "anthropic_messages"):
+                            config["model"]["api_mode"] = val
+                        else:
+                            config["model"].pop("api_mode", None)
+                    if "context_length" in msg:
+                        val = msg["context_length"]
+                        if val is not None:
+                            try:
+                                config["model"]["context_length"] = int(val)
+                            except (TypeError, ValueError):
+                                pass
+                        else:
+                            config["model"].pop("context_length", None)
+                    f.seek(0)
+                    f.truncate()
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as exc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-default-model",
+                            code="CONFIG_WRITE_FAILED",
+                            message=str(exc)[:500])
+            return
+
+        await conn.send("config.ok", ref_id=msg.get("id"),
+                         action="set-default-model")
+        logger.info("[desktop] config.set-default-model → %s (%s)", model_id, provider_slug)
+
+        # Refresh model catalog for the new provider
+        models_payload = await self._build_models_payload()
+        if models_payload:
+            await conn.send("models.refresh", **models_payload)
+
+    async def _handle_config_set_credential(self, conn: _Connection, msg: dict) -> None:
+        """Write API key to ~/.hermes/.env."""
+        from dotenv import set_key
+
+        provider_slug = msg.get("provider_slug", "")
+        api_key = msg.get("api_key", "")
+
+        bp = next((p for p in self._BUILTIN_PROVIDERS if p["slug"] == provider_slug), None)
+        if not bp or not bp["env_var"]:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-credential",
+                            code="INVALID_PROVIDER",
+                            message=f"Unknown provider: {provider_slug}")
+            return
+
+        if not api_key or len(api_key) < 4:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-credential",
+                            code="INVALID_CREDENTIAL",
+                            message="API Key 格式无效")
+            return
+
+        env_path = Path.home() / ".hermes" / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        if not env_path.exists():
+            env_path.touch()
+
+        try:
+            set_key(str(env_path), bp["env_var"], api_key)
+        except Exception as exc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-credential",
+                            code="CONFIG_WRITE_FAILED",
+                            message=str(exc)[:500])
+            return
+
+        # Sync to os.environ so list_authenticated_providers sees it immediately
+        os.environ[bp["env_var"]] = api_key
+
+        await conn.send("config.ok", ref_id=msg.get("id"),
+                         action="set-credential",
+                         provider_slug=provider_slug,
+                         credential_hint=self._mask_key(api_key))
+        logger.info("[desktop] config.set-credential → %s", provider_slug)
+
+        # Refresh model catalog so the new provider's models appear in the dropdown
+        models_payload = await self._build_models_payload()
+        if models_payload:
+            await conn.send("models.refresh", **models_payload)
+
+    async def _handle_config_set_endpoint(self, conn: _Connection, msg: dict) -> None:
+        """Upsert a custom endpoint in config.yaml custom_providers."""
+        from urllib.parse import urlparse
+
+        slug = msg.get("slug", "")
+        name = msg.get("name", "")
+        base_url = msg.get("base_url", "")
+
+        if not name or not base_url:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-endpoint",
+                            code="INVALID_URL",
+                            message="name and base_url are required")
+            return
+
+        parsed = urlparse(base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-endpoint",
+                            code="INVALID_URL",
+                            message="请输入有效的 HTTP(S) URL")
+            return
+
+        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        import yaml
+
+        try:
+            with open(config_path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    config = yaml.safe_load(f) or {}
+                    if "custom_providers" not in config:
+                        config["custom_providers"] = []
+
+                    entry = {
+                        "name": name,
+                        "base_url": base_url,
+                        "default_model": msg.get("default_model", ""),
+                        "api_mode": msg.get("api_mode", "chat_completions"),
+                    }
+                    if msg.get("api_key"):
+                        entry["api_key"] = msg["api_key"]
+                    if msg.get("context_length"):
+                        entry["context_length"] = msg["context_length"]
+
+                    found = False
+                    target_slug = slug or self._slugify(name)
+                    for i, cp in enumerate(config["custom_providers"]):
+                        cp_slug = self._slugify(cp.get("name", ""))
+                        if cp_slug == target_slug:
+                            config["custom_providers"][i] = entry
+                            found = True
+                            break
+
+                    if not found:
+                        config["custom_providers"].append(entry)
+
+                    f.seek(0)
+                    f.truncate()
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as exc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="set-endpoint",
+                            code="CONFIG_WRITE_FAILED",
+                            message=str(exc)[:500])
+            return
+
+        await conn.send("config.ok", ref_id=msg.get("id"),
+                         action="set-endpoint")
+        logger.info("[desktop] config.set-endpoint → %s (%s)", name, base_url)
+
+    async def _handle_config_delete_endpoint(self, conn: _Connection, msg: dict) -> None:
+        """Remove a custom endpoint from config.yaml."""
+        slug = msg.get("slug", "")
+        if not slug:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="delete-endpoint",
+                            code="INVALID_PROVIDER",
+                            message="slug is required")
+            return
+
+        config_path = Path.home() / ".hermes" / "config.yaml"
+        if not config_path.exists():
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="delete-endpoint",
+                            code="INVALID_PROVIDER",
+                            message=f"Endpoint not found: {slug}")
+            return
+
+        import yaml
+
+        not_found = False
+        try:
+            with open(config_path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    config = yaml.safe_load(f) or {}
+                    providers = config.get("custom_providers", [])
+                    original_len = len(providers)
+                    config["custom_providers"] = [
+                        cp for cp in providers
+                        if self._slugify(cp.get("name", "")) != slug
+                    ]
+
+                    if len(config["custom_providers"]) == original_len:
+                        not_found = True
+                    else:
+                        f.seek(0)
+                        f.truncate()
+                        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as exc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="delete-endpoint",
+                            code="CONFIG_WRITE_FAILED",
+                            message=str(exc)[:500])
+            return
+
+        if not_found:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="delete-endpoint",
+                            code="INVALID_PROVIDER",
+                            message=f"Endpoint not found: {slug}")
+            return
+
+        await conn.send("config.ok", ref_id=msg.get("id"),
+                         action="delete-endpoint")
+        logger.info("[desktop] config.delete-endpoint → %s", slug)
+
+    # Allowlist of keys the desktop UI is permitted to write via config.update.
+    _UPDATABLE_KEYS: frozenset = frozenset({
+        "agent.max_turns", "agent.reasoning_effort", "agent.tool_use_enforcement",
+        "memory.memory_enabled", "memory.user_profile_enabled",
+        "memory.memory_char_limit", "memory.user_char_limit",
+        "compression.enabled", "compression.threshold",
+        "compression.target_ratio", "compression.protect_last_n",
+        "approvals.mode",
+        "file_read_max_chars",
+        "security.redact_secrets",
+        "display.show_reasoning", "display.show_cost",
+        "display.tool_progress", "display.compact",
+        "display.streaming",
+    })
+
+    async def _handle_config_update(self, conn: _Connection, msg: dict) -> None:
+        """Allowlisted config.yaml updater — applies dot-path key:value pairs."""
+        updates = msg.get("updates")
+        if not isinstance(updates, dict) or not updates:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="update",
+                            code="INVALID_UPDATES",
+                            message="updates must be a non-empty dict")
+            return
+
+        for dot_key, value in updates.items():
+            if dot_key not in self._UPDATABLE_KEYS:
+                await conn.send("config.error", ref_id=msg.get("id"),
+                                action="update",
+                                code="FORBIDDEN_KEY",
+                                message=f"Key not allowed: {dot_key}")
+                return
+            if not isinstance(value, (str, int, float, bool, type(None))):
+                await conn.send("config.error", ref_id=msg.get("id"),
+                                action="update",
+                                code="INVALID_VALUE",
+                                message=f"Invalid value type for {dot_key}")
+                return
+            parts = dot_key.split(".")
+            if not all(parts):
+                await conn.send("config.error", ref_id=msg.get("id"),
+                                action="update",
+                                code="INVALID_KEY",
+                                message=f"Malformed key: {dot_key}")
+                return
+
+        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        import yaml
+
+        try:
+            with open(config_path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    config = yaml.safe_load(f) or {}
+
+                    for dot_key, value in updates.items():
+                        parts = dot_key.split(".")
+                        target = config
+                        for part in parts[:-1]:
+                            if part not in target or not isinstance(target[part], dict):
+                                target[part] = {}
+                            target = target[part]
+                        target[parts[-1]] = value
+
+                    f.seek(0)
+                    f.truncate()
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        except Exception as exc:
+            await conn.send("config.error", ref_id=msg.get("id"),
+                            action="update",
+                            code="CONFIG_WRITE_FAILED",
+                            message=str(exc)[:500])
+            return
+
+        await conn.send("config.ok", ref_id=msg.get("id"), action="update")
+        logger.info("[desktop] config.update → %s", list(updates.keys()))
