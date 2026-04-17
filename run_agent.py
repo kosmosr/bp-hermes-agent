@@ -7449,7 +7449,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, call_id=tc.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -7584,6 +7584,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            call_id=tc.id,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
@@ -7714,7 +7715,7 @@ class AIAgent:
             if _block_msg is None and self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args, call_id=tool_call.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -7951,6 +7952,7 @@ class AIAgent:
                     self.tool_progress_callback(
                         "tool.completed", function_name, None, None,
                         duration=tool_duration, is_error=_is_error_result,
+                        call_id=tool_call.id,
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
@@ -7983,7 +7985,7 @@ class AIAgent:
             tool_msg = {
                 "role": "tool",
                 "content": function_result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call.id,
             }
             messages.append(tool_msg)
 
@@ -8591,11 +8593,13 @@ class AIAgent:
                                     break
                                 _tcid = _tm.get("tool_call_id")
                                 if _tcid:
-                                    _results_by_id[_tcid] = _tm.get("content", "")
+                                    _results_by_id[_tcid] = {
+                                        "content": _tm.get("content", ""),
+                                    }
                             prev_tools = [
                                 {
                                     "name": tc["function"]["name"],
-                                    "result": _results_by_id.get(tc.get("id")),
+                                    "result": _results_by_id.get(tc.get("id"), {}).get("content"),
                                 }
                                 for tc in _m["tool_calls"]
                                 if isinstance(tc, dict)

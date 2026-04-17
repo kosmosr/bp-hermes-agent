@@ -18,6 +18,10 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import IO, Callable, Protocol
 
+# Thread-local storage for tool output streaming callback.
+# Set by run_agent.py before tool execution, read by _drain() in _wait_for_process.
+_tool_output_tls = threading.local()
+
 from hermes_constants import get_hermes_home
 from tools.interrupt import is_interrupted
 
@@ -415,11 +419,19 @@ class BaseEnvironment(ABC):
         doesn't kill long-running commands.
         """
         output_chunks: list[str] = []
+        # Capture tool output callback from parent thread's TLS
+        _cb = getattr(_tool_output_tls, 'callback', None)
+        _call_id = getattr(_tool_output_tls, 'call_id', None)
 
         def _drain():
             try:
                 for line in proc.stdout:
                     output_chunks.append(line)
+                    if _cb and _call_id:
+                        try:
+                            _cb(_call_id, "stdout", line)
+                        except Exception:
+                            pass
             except UnicodeDecodeError:
                 output_chunks.clear()
                 output_chunks.append(

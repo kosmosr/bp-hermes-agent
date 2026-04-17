@@ -81,6 +81,11 @@ DEFAULT_MAX_ITERATIONS = 50
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
+# Lock for _last_resolved_tool_names save/restore in delegate_task.
+# Concurrent executor threads calling delegate_task could corrupt this global
+# if multiple parents build children simultaneously.
+_tool_names_lock = threading.Lock()
+
 
 def check_delegate_requirements() -> bool:
     """Delegation has no external requirements -- always available."""
@@ -232,6 +237,25 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             _batch.clear()
 
     _callback._flush = _flush
+
+    # Step callback: relay child's step progress as delegation.progress
+    # so desktop.py can emit delegation.progress envelopes
+    def _step_cb(iteration: int, prev_tools: list):
+        if parent_cb:
+            try:
+                parent_cb(
+                    "delegation.progress",
+                    tool_name=None,
+                    preview=None,
+                    args=None,
+                    iteration=iteration,
+                    prev_tools=prev_tools,
+                    task_index=task_index,
+                )
+            except Exception as e:
+                logger.debug("Delegation progress relay failed: %s", e)
+
+    _callback._step_cb = _step_cb
     return _callback
 
 
@@ -373,6 +397,7 @@ def _build_child_agent(
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
         tool_progress_callback=child_progress_cb,
+        step_callback=getattr(child_progress_cb, '_step_cb', None) if child_progress_cb else None,
         iteration_budget=None,  # fresh budget per subagent
     )
     child._print_fn = getattr(parent_agent, '_print_fn', None)
@@ -626,6 +651,7 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    model: Optional[str] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
@@ -702,31 +728,34 @@ def delegate_task(
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
+    # Lock prevents concurrent delegate_task calls from corrupting each other.
     import model_tools as _model_tools
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
+    with _tool_names_lock:
+        _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
-    # Build all child agents on the main thread (thread-safe construction)
-    # Wrapped in try/finally so the global is always restored even if a
-    # child build raises (otherwise _last_resolved_tool_names stays corrupted).
-    children = []
-    try:
-        for i, t in enumerate(task_list):
-            child = _build_child_agent(
-                task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
-                max_iterations=effective_max_iter, parent_agent=parent_agent,
-                override_provider=creds["provider"], override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command") or acp_command,
-                override_acp_args=t.get("acp_args") or acp_args,
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            children.append((i, t, child))
-    finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+        # Build all child agents under the lock (thread-safe construction).
+        # Wrapped in try/finally so the global is always restored even if a
+        # child build raises (otherwise _last_resolved_tool_names stays corrupted).
+        children = []
+        try:
+            for i, t in enumerate(task_list):
+                child = _build_child_agent(
+                    task_index=i, goal=t["goal"], context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets,
+                    model=t.get("model") or model or creds["model"],
+                    max_iterations=effective_max_iter, parent_agent=parent_agent,
+                    override_provider=creds["provider"], override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_acp_command=t.get("acp_command") or acp_command,
+                    override_acp_args=t.get("acp_args") or acp_args,
+                )
+                # Override with correct parent tool names (before child construction mutated global)
+                child._delegate_saved_tool_names = _parent_tool_names
+                children.append((i, t, child))
+        finally:
+            # Authoritative restore: reset global to parent's tool names after all children built
+            _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
@@ -1080,6 +1109,10 @@ DELEGATE_TASK_SCHEMA = {
                             "items": {"type": "string"},
                             "description": "Per-task ACP args override.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -1097,6 +1130,15 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Max tool-calling turns per subagent (default: 50). "
                     "Only set lower for simple tasks."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the model for this delegation. When set, subagents "
+                    "use this model instead of the configured delegation model. "
+                    "Example: 'claude-sonnet-4-6', 'gpt-4o'. Leave unset to use "
+                    "the default delegation model."
                 ),
             },
             "acp_command": {
