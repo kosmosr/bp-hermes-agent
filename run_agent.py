@@ -7480,12 +7480,21 @@ class AIAgent:
                 set_activity_callback(self._touch_activity)
             except Exception:
                 pass
+            _tool_output_cb = getattr(self, 'tool_output_callback', None)
+            if _tool_output_cb:
+                from tools.environments.base import _tool_output_tls
+                _tool_output_tls.callback = _tool_output_cb
+                _tool_output_tls.call_id = tool_call.id
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            finally:
+                if _tool_output_cb:
+                    _tool_output_tls.callback = None
+                    _tool_output_tls.call_id = None
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
@@ -7751,6 +7760,12 @@ class AIAgent:
 
             tool_start_time = time.time()
 
+            _tool_output_cb = getattr(self, 'tool_output_callback', None)
+            if _tool_output_cb:
+                from tools.environments.base import _tool_output_tls
+                _tool_output_tls.callback = _tool_output_cb
+                _tool_output_tls.call_id = tool_call.id
+
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
@@ -7959,6 +7974,11 @@ class AIAgent:
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
+
+            if _tool_output_cb:
+                from tools.environments.base import _tool_output_tls
+                _tool_output_tls.callback = None
+                _tool_output_tls.call_id = None
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")

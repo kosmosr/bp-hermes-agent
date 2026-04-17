@@ -1576,12 +1576,17 @@ class DesktopAdapter(BasePlatformAdapter):
         # --- Iteration progress ---
         def _on_step(iteration, prev_tools):
             """Receive iteration progress from agent loop."""
-            tool_summaries = [
-                {"name": t.get("name", "?"),
-                 "result": "error" if t.get("is_error") else
-                           "ok" if t.get("result") is not None else None}
-                for t in (prev_tools or [])
-            ]
+            from agent.display import _detect_tool_failure
+            tool_summaries = []
+            for t in (prev_tools or []):
+                name = t.get("name", "?")
+                result = t.get("result")
+                is_err, _ = _detect_tool_failure(name, result)
+                tool_summaries.append({
+                    "name": name,
+                    "result": "error" if is_err else
+                              "ok" if result is not None else None,
+                })
             asyncio.run_coroutine_threadsafe(
                 self._broadcast_to_session(session_id, {
                     "kind": "turn.progress",
@@ -1838,11 +1843,15 @@ class DesktopAdapter(BasePlatformAdapter):
             tool_progress_callback=_on_tool_progress,
             reasoning_callback=_on_reasoning,
             clarify_callback=self._make_clarify_callback(session_id, turn_id, loop),
-            tool_output_callback=_on_tool_output,
             step_callback=_on_step,
             model_override=model_override,
             ephemeral_system_prompt=ephemeral_prompt,
         )
+        # Assign tool output callback as an attribute rather than __init__ kwarg,
+        # so AIAgent.__init__ stays identical to upstream. The parallel/sequential
+        # tool execution paths in run_agent.py read this via getattr() and set
+        # thread-local state within each worker before invoking the tool.
+        agent.tool_output_callback = _on_tool_output
         active.agent = agent
 
         active.task = asyncio.create_task(
@@ -1856,7 +1865,6 @@ class DesktopAdapter(BasePlatformAdapter):
                                 reasoning_callback=None,
                                 clarify_callback=None,
                                 ephemeral_system_prompt=None,
-                                tool_output_callback=None,
                                 step_callback=None,
                                 model_override=None):
         """Create an AIAgent instance — mirrors api_server.py:404 pattern.
@@ -1942,7 +1950,6 @@ class DesktopAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
-            tool_output_callback=tool_output_callback,
             step_callback=step_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
