@@ -873,10 +873,14 @@ class DesktopAdapter(BasePlatformAdapter):
                 logger.debug("[desktop] could not load model catalog for welcome")
 
             # Send welcome
+            try:
+                from hermes_cli import __version__ as _hermes_version
+            except ImportError:
+                _hermes_version = "unknown"
             await conn.send(
                 "welcome",
                 capabilities=["approval", "reasoning", "tool_events", "interrupt", "markdown"],
-                server={"version": VERSION, "hermes_version": "0.8.x"},
+                server={"version": VERSION, "hermes_version": _hermes_version},
                 sessions=[
                     {"session_id": sid, "title": info["title"],
                      "created_at": info.get("created_at"),
