@@ -1,6 +1,7 @@
 """Integration tests for desktop adapter WebSocket handshake."""
 import asyncio
 import pytest
+import pytest_asyncio
 import aiohttp
 from aiohttp import web
 import tempfile
@@ -10,7 +11,7 @@ import shutil
 from gateway.config import PlatformConfig, Platform
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def desktop_adapter():
     """Create a DesktopAdapter with in-memory config for testing."""
     from gateway.platforms.desktop import DesktopAdapter

@@ -123,6 +123,9 @@ class TestSingleToolCall:
             "call_id": "call-1",
             "tool": "shell",
             "preview": '{"cmd": "ls"}',
+            "args": {"cmd": "ls"},
+            "tool_emoji": "",
+            "toolset": "",
             "ts": "t2",
         }
         assert events[3] == {
