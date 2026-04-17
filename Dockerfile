@@ -35,8 +35,9 @@ RUN npm install --prefer-offline --no-audit && \
 RUN chown -R hermes:hermes /opt/hermes
 USER hermes
 
+ARG PIP_EXTRAS="all"
 RUN uv venv && \
-    uv pip install --no-cache-dir -e ".[all]"
+    uv pip install --no-cache-dir -e ".[${PIP_EXTRAS}]"
 
 USER root
 RUN chmod +x /opt/hermes/docker/entrypoint.sh
