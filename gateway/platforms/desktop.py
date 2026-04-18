@@ -1617,10 +1617,15 @@ class DesktopAdapter(BasePlatformAdapter):
             # envelopes so the desktop client can render DelegationCard UI.
             if event_type == "delegation.progress":
                 # Relayed from child agent's step_callback via
-                # _build_child_progress_callback._step_cb
+                # _build_child_progress_callback._step_cb.
+                # call_id matches the active delegate_task tool call so the
+                # renderer (turns.ts applyEvent) can locate the correct
+                # DelegationState. Batch mode: all concurrent children share
+                # the parent's call_id (one card per delegate_task call).
                 env = {
                     "kind": "delegation.progress",
                     "turn_id": turn_id,
+                    "call_id": _active_tool_calls.get("delegate_task"),
                     "iteration": kw.get("iteration", 0),
                     "prev_tools": kw.get("prev_tools", []),
                     "task_index": kw.get("task_index", 0),
