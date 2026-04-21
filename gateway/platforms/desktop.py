@@ -1654,10 +1654,19 @@ class DesktopAdapter(BasePlatformAdapter):
                     if not role_id:
                         role_id = args.get("_role_id")
                 # Lookup role_name from stored mentions
+                mention = None
                 if role_id and active.mentions:
                     mention = active.mentions.get(role_id)
                     if mention:
                         role_name = mention.get("role_name")
+                # Phase 8: prefer mention.model (authoritative per-role config
+                # from the client) over the AI-provided tool kwarg.  Fallback
+                # to args.model lets AI-authored one-off overrides still flow.
+                mention_model = None
+                if isinstance(mention, dict):
+                    _mm = mention.get("model")
+                    if isinstance(_mm, str) and _mm.strip():
+                        mention_model = _mm.strip()
                 env = {
                     "kind": "delegation.started",
                     "turn_id": turn_id,
@@ -1666,7 +1675,7 @@ class DesktopAdapter(BasePlatformAdapter):
                     "goal": (args or {}).get("goal", ""),
                     "role_id": role_id,
                     "role_name": role_name,
-                    "model": (args or {}).get("model"),
+                    "model": mention_model or (args or {}).get("model"),
                 }
                 asyncio.run_coroutine_threadsafe(
                     self._broadcast_to_session(session_id, env), loop
@@ -2021,6 +2030,10 @@ class DesktopAdapter(BasePlatformAdapter):
         async with self._turn_semaphore:
             try:
                 history = self._session_histories.get(session_id)
+                # Phase 8: expose active.mentions to the agent so delegate_task
+                # can look up per-role {model, provider_slug} from PromptSendMsg
+                # and override the spawned child's runtime credentials.
+                active.agent._delegation_mentions = active.mentions or {}
                 result = await loop.run_in_executor(
                     None,
                     lambda: active.agent.run_conversation(
@@ -2106,6 +2119,12 @@ class DesktopAdapter(BasePlatformAdapter):
                     "code": "AGENT_EXCEPTION", "message": str(exc)[:500],
                 })
             finally:
+                # Phase 8: clear per-turn delegation mentions to prevent leakage
+                # into a subsequent turn on the same agent instance.
+                try:
+                    active.agent._delegation_mentions = None
+                except Exception:
+                    pass
                 unregister_gateway_notify(session_key)
                 reset_current_session_key(approval_token)
                 os.environ.pop("HERMES_SESSION_KEY", None)

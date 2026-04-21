@@ -645,6 +645,105 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+
+def _extract_task_role_id(task: Dict[str, Any]) -> Optional[str]:
+    """Extract the role_id a task belongs to.
+
+    Priority:
+      1. Explicit `_role_id` field on the task (workflow / future use).
+      2. First three lines of `context` for a `role_id: <id>` prefix —
+         this mirrors the AI-authored convention from the ephemeral system
+         prompt (same pattern used by gateway/platforms/desktop.py:1648).
+    Returns None when no role_id is discernible.
+    """
+    explicit = task.get("_role_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    context = task.get("context") or ""
+    if isinstance(context, str):
+        for line in context.split("\n")[:3]:
+            stripped = line.strip()
+            if stripped.startswith("role_id:"):
+                rid = stripped[len("role_id:"):].strip()
+                if rid:
+                    return rid
+    return None
+
+
+def _resolve_role_credentials(mention: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Resolve child AIAgent credentials for a per-role delegation override.
+
+    Input: a single entry from ``_ActiveTurn.mentions`` (as produced by
+    ``desktop.py`` from ``PromptSendMsg.mentions[]``).  Keys of interest:
+    ``role_id``, ``model`` (optional str), ``provider_slug`` (optional str).
+
+    Behaviour:
+      * ``None`` / non-dict / both fields empty → return ``None`` so the
+        caller falls back to the default delegation credentials.
+      * ``model`` non-empty but ``provider_slug`` empty → emit a warning and
+        return ``None`` (we do not try to guess the provider; that would
+        couple us to a specific model-id naming scheme).  Matches the
+        client-side three-branch contract in
+        ``hermes-desktop/src/renderer/utils/prompt-send.ts::buildMentionsFromTeam``.
+      * Both fields non-empty → resolve the provider slug via
+        :func:`hermes_cli.runtime_provider.resolve_runtime_provider` and
+        return a dict shaped identically to ``_resolve_delegation_credentials``
+        so the caller can splat it into ``_build_child_agent``'s ``override_*``
+        parameters.
+
+    Raises:
+      ValueError: provider_slug cannot be resolved, or resolves with no API
+        key.  The caller is expected to turn this into a per-task error entry
+        so sibling tasks in a batch are not affected.
+    """
+    if not isinstance(mention, dict):
+        return None
+    role_model = mention.get("model")
+    role_model = role_model.strip() if isinstance(role_model, str) else None
+    provider_slug = mention.get("provider_slug")
+    provider_slug = provider_slug.strip() if isinstance(provider_slug, str) else None
+
+    if not role_model and not provider_slug:
+        return None
+    if role_model and not provider_slug:
+        logger.warning(
+            "role '%s' has model=%r without provider_slug; falling back to "
+            "default delegation credentials.",
+            mention.get("role_id", "<unknown>"), role_model,
+        )
+        return None
+
+    role_id = mention.get("role_id", "<unknown>")
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(requested=provider_slug)
+    except Exception as exc:
+        raise ValueError(
+            f"role '{role_id}' provider_slug '{provider_slug}' cannot be "
+            f"resolved: {exc}"
+        ) from exc
+
+    api_key = runtime.get("api_key") or ""
+    if not api_key:
+        raise ValueError(
+            f"role '{role_id}' provider '{provider_slug}' resolved but has "
+            f"no API key. Set the appropriate environment variable or run "
+            f"'hermes auth'."
+        )
+
+    return {
+        "model": role_model,
+        "provider": runtime.get("provider"),
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        # Preserve ACP transport hints (non-empty only for copilot-acp et al.)
+        # so a role pointing at an ACP-style provider spawns correctly.
+        "command": runtime.get("command") or None,
+        "args": list(runtime.get("args") or []),
+    }
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -725,6 +824,12 @@ def delegate_task(
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
+    # Phase 8: pick up client-provided per-role mentions (set by desktop.py
+    # _run_agent_async just before invoking run_conversation).  Each task may
+    # carry a role_id that maps to a distinct {model, provider_slug},
+    # overriding the default delegation credentials.
+    delegation_mentions: Dict[str, Any] = getattr(parent_agent, "_delegation_mentions", None) or {}
+
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
     # which overwrites model_tools._last_resolved_tool_names with child's toolset.
@@ -736,32 +841,93 @@ def delegate_task(
         # Build all child agents under the lock (thread-safe construction).
         # Wrapped in try/finally so the global is always restored even if a
         # child build raises (otherwise _last_resolved_tool_names stays corrupted).
-        children = []
+        # children items: (task_index, task_dict, child_or_None, role_error_or_None)
+        children: List[Any] = []
         try:
             for i, t in enumerate(task_list):
+                # Phase 8: resolve per-role credential override.  Falls back
+                # to default ``creds`` when the task has no role mention, or
+                # when the mention lacks a usable provider_slug.
+                task_role_id = _extract_task_role_id(t)
+                role_mention = (
+                    delegation_mentions.get(task_role_id)
+                    if task_role_id else None
+                )
+                try:
+                    role_creds = _resolve_role_credentials(role_mention)
+                except ValueError as exc:
+                    logger.warning(
+                        "delegate_task: role credential resolution failed for "
+                        "task %d (role_id=%s): %s",
+                        i, task_role_id, exc,
+                    )
+                    children.append((i, t, None, str(exc)))
+                    continue
+
+                effective_creds = role_creds or creds
+                # Role mention (when resolved) is the authoritative source for
+                # the model — it is persisted to teams.json by the client and
+                # paired with provider/base_url/api_key/api_mode above.  If we
+                # let `t.get("model")` (an AI-authored tool kwarg) override it,
+                # the child would run on role's provider + AI's model, which is
+                # almost always a broken combination.  Task/top-level model are
+                # only consulted when the role has no model preference.
+                effective_model = (
+                    (role_creds.get("model") if role_creds else None)
+                    or t.get("model")
+                    or model
+                    or creds.get("model")
+                )
+                # ACP command/args follow the same authority ladder: role
+                # override (if the resolved runtime ships with command/args,
+                # e.g. copilot-acp) beats task/top-level overrides.
+                role_acp_command = role_creds.get("command") if role_creds else None
+                role_acp_args = role_creds.get("args") if role_creds else None
+                effective_override_acp_command = (
+                    role_acp_command or t.get("acp_command") or acp_command
+                )
+                effective_override_acp_args = (
+                    role_acp_args
+                    if role_acp_args
+                    else (t.get("acp_args") or acp_args)
+                )
                 child = _build_child_agent(
                     task_index=i, goal=t["goal"], context=t.get("context"),
                     toolsets=t.get("toolsets") or toolsets,
-                    model=t.get("model") or model or creds["model"],
+                    model=effective_model,
                     max_iterations=effective_max_iter, parent_agent=parent_agent,
-                    override_provider=creds["provider"], override_base_url=creds["base_url"],
-                    override_api_key=creds["api_key"],
-                    override_api_mode=creds["api_mode"],
-                    override_acp_command=t.get("acp_command") or acp_command,
-                    override_acp_args=t.get("acp_args") or acp_args,
+                    override_provider=effective_creds["provider"],
+                    override_base_url=effective_creds["base_url"],
+                    override_api_key=effective_creds["api_key"],
+                    override_api_mode=effective_creds["api_mode"],
+                    override_acp_command=effective_override_acp_command,
+                    override_acp_args=effective_override_acp_args,
                 )
                 # Override with correct parent tool names (before child construction mutated global)
                 child._delegate_saved_tool_names = _parent_tool_names
-                children.append((i, t, child))
+                children.append((i, t, child, None))
         finally:
             # Authoritative restore: reset global to parent's tool names after all children built
             _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
-        _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
-        results.append(result)
+        _i, _t, child, role_error = children[0]
+        if child is None:
+            # Phase 8: per-role credentials failed to resolve — surface as a
+            # task-level error so the client receives a delegation.completed
+            # with a usable message, without aborting sibling calls.
+            results.append({
+                "task_index": 0,
+                "status": "error",
+                "summary": None,
+                "error": role_error or "Role credential resolution failed.",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            })
+        else:
+            result = _run_single_child(0, _t["goal"], child, parent_agent)
+            results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -769,7 +935,20 @@ def delegate_task(
 
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
-            for i, t, child in children:
+            for i, t, child, role_error in children:
+                if child is None:
+                    # Phase 8: synthesise error entry for failed role
+                    # resolution; do not submit to the thread pool.
+                    results.append({
+                        "task_index": i,
+                        "status": "error",
+                        "summary": None,
+                        "error": role_error or "Role credential resolution failed.",
+                        "api_calls": 0,
+                        "duration_seconds": 0,
+                    })
+                    completed_count += 1
+                    continue
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,

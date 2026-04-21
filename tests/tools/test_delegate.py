@@ -26,9 +26,11 @@ from tools.delegate_tool import (
     delegate_task,
     _build_child_agent,
     _build_child_system_prompt,
-    _strip_blocked_tools,
+    _extract_task_role_id,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_role_credentials,
+    _strip_blocked_tools,
 )
 
 
@@ -52,6 +54,9 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    # Phase 8: opt out of mention-based override by default so MagicMock's
+    # auto-attribute behaviour does not return a non-None sentinel.
+    parent._delegation_mentions = None
     return parent
 
 
@@ -1276,6 +1281,393 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
+
+
+class TestExtractTaskRoleId(unittest.TestCase):
+    """_extract_task_role_id pulls role_id from explicit field or context head."""
+
+    def test_explicit_role_id(self):
+        self.assertEqual(_extract_task_role_id({"_role_id": "r1"}), "r1")
+
+    def test_explicit_role_id_trimmed(self):
+        self.assertEqual(_extract_task_role_id({"_role_id": "  r1  "}), "r1")
+
+    def test_context_prefix_with_space(self):
+        self.assertEqual(
+            _extract_task_role_id({"context": "role_id: r2\nnext"}),
+            "r2",
+        )
+
+    def test_context_prefix_no_space(self):
+        self.assertEqual(
+            _extract_task_role_id({"context": "role_id:r3\nnext"}),
+            "r3",
+        )
+
+    def test_beyond_three_lines_ignored(self):
+        ctx = "line1\nline2\nline3\nrole_id: r4"
+        self.assertIsNone(_extract_task_role_id({"context": ctx}))
+
+    def test_no_role(self):
+        self.assertIsNone(_extract_task_role_id({"context": "no role info"}))
+
+    def test_empty_task(self):
+        self.assertIsNone(_extract_task_role_id({}))
+
+    def test_empty_explicit_falls_to_context(self):
+        self.assertEqual(
+            _extract_task_role_id({"_role_id": "  ", "context": "role_id: r5"}),
+            "r5",
+        )
+
+
+class TestResolveRoleCredentials(unittest.TestCase):
+    """_resolve_role_credentials translates a mention into override creds."""
+
+    def test_none(self):
+        self.assertIsNone(_resolve_role_credentials(None))
+
+    def test_non_dict(self):
+        self.assertIsNone(_resolve_role_credentials("not a dict"))
+
+    def test_empty_dict(self):
+        self.assertIsNone(_resolve_role_credentials({}))
+
+    def test_both_empty_strings(self):
+        self.assertIsNone(_resolve_role_credentials({
+            "role_id": "r", "model": "", "provider_slug": ""
+        }))
+
+    def test_model_only_no_slug(self):
+        """model without provider_slug → fallback (no guessing)."""
+        self.assertIsNone(_resolve_role_credentials({
+            "role_id": "r", "model": "x"
+        }))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_valid_mention_returns_merged_creds(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-***",
+            "api_mode": "anthropic_messages",
+        }
+        result = _resolve_role_credentials({
+            "role_id": "r1",
+            "model": "claude-opus-4-7",
+            "provider_slug": "anthropic",
+        })
+        self.assertEqual(result, {
+            "model": "claude-opus-4-7",
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-***",
+            "api_mode": "anthropic_messages",
+            # Non-ACP provider — command absent, args empty list.
+            "command": None,
+            "args": [],
+        })
+        mock_resolve.assert_called_once_with(requested="anthropic")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_acp_mention_preserves_command_and_args(self, mock_resolve):
+        """ACP-style provider (copilot-acp etc.) surfaces command/args."""
+        mock_resolve.return_value = {
+            "provider": "copilot-acp",
+            "base_url": "",
+            "api_key": "gh_pat_***",
+            "api_mode": "acp",
+            "command": "copilot-language-server",
+            "args": ["--acp"],
+        }
+        result = _resolve_role_credentials({
+            "role_id": "r1",
+            "model": "gpt-4o",
+            "provider_slug": "copilot-acp",
+        })
+        self.assertEqual(result["command"], "copilot-language-server")
+        self.assertEqual(result["args"], ["--acp"])
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_unknown_slug_raises_value_error(self, mock_resolve):
+        mock_resolve.side_effect = RuntimeError("unknown provider")
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_role_credentials({
+                "role_id": "r1",
+                "model": "x",
+                "provider_slug": "bogus",
+            })
+        msg = str(ctx.exception)
+        self.assertIn("r1", msg)
+        self.assertIn("bogus", msg)
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_resolved_without_api_key_raises(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "anthropic", "base_url": "https://x",
+            "api_key": "", "api_mode": "anthropic_messages",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_role_credentials({
+                "role_id": "r1",
+                "model": "x",
+                "provider_slug": "anthropic",
+            })
+        self.assertIn("no API key", str(ctx.exception))
+
+
+class TestDelegateTaskRoleOverride(unittest.TestCase):
+    """delegate_task integrates _delegation_mentions from the parent agent."""
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_mention_overrides_creds(
+        self, mock_resolve, mock_build, mock_run, _cfg,
+    ):
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-***",
+            "api_mode": "anthropic_messages",
+        }
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        parent._delegation_mentions = {
+            "researcher": {
+                "role_id": "researcher",
+                "model": "claude-opus-4-7",
+                "provider_slug": "anthropic",
+            }
+        }
+        result = json.loads(delegate_task(
+            goal="Research X",
+            context="role_id: researcher\nextra",
+            parent_agent=parent,
+        ))
+        self.assertEqual(result["results"][0]["status"], "completed")
+        kwargs = mock_build.call_args.kwargs
+        self.assertEqual(kwargs["model"], "claude-opus-4-7")
+        self.assertEqual(kwargs["override_provider"], "anthropic")
+        self.assertEqual(kwargs["override_base_url"], "https://api.anthropic.com")
+        self.assertEqual(kwargs["override_api_key"], "sk-ant-***")
+        self.assertEqual(kwargs["override_api_mode"], "anthropic_messages")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_bad_slug_single_task(
+        self, mock_resolve, mock_build, mock_run, _cfg,
+    ):
+        mock_resolve.side_effect = RuntimeError("unknown provider: bogus")
+        parent = _make_mock_parent()
+        parent._delegation_mentions = {
+            "r1": {
+                "role_id": "r1", "model": "x", "provider_slug": "bogus",
+            }
+        }
+        result = json.loads(delegate_task(
+            goal="Test bad slug",
+            context="role_id: r1",
+            parent_agent=parent,
+        ))
+        self.assertEqual(result["results"][0]["status"], "error")
+        err = result["results"][0]["error"]
+        self.assertIn("r1", err)
+        self.assertIn("bogus", err)
+        mock_build.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_no_mentions_falls_back(self, mock_build, mock_run, _cfg):
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        # _make_mock_parent already sets _delegation_mentions = None
+        result = json.loads(delegate_task(goal="No mention", parent_agent=parent))
+        self.assertEqual(result["results"][0]["status"], "completed")
+        kwargs = mock_build.call_args.kwargs
+        # No delegation.provider configured + no mention → override_provider None
+        self.assertIsNone(kwargs["override_provider"])
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_batch_mixed_good_and_bad(
+        self, mock_resolve, mock_build, mock_run, _cfg,
+    ):
+        """Bad role in batch produces a task-level error; siblings proceed."""
+        def _side_effect(*, requested):
+            if requested == "anthropic":
+                return {
+                    "provider": "anthropic",
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant-***",
+                    "api_mode": "anthropic_messages",
+                }
+            raise RuntimeError(f"unknown: {requested}")
+
+        mock_resolve.side_effect = _side_effect
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 1, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        parent._delegation_mentions = {
+            "bad_role": {
+                "role_id": "bad_role", "model": "x",
+                "provider_slug": "totally-bogus",
+            },
+            "good_role": {
+                "role_id": "good_role", "model": "claude-opus-4-7",
+                "provider_slug": "anthropic",
+            },
+        }
+        tasks = [
+            {"goal": "Bad one", "context": "role_id: bad_role"},
+            {"goal": "Good one", "context": "role_id: good_role"},
+        ]
+        result = json.loads(delegate_task(tasks=tasks, parent_agent=parent))
+        by_idx = {r["task_index"]: r for r in result["results"]}
+        self.assertEqual(by_idx[0]["status"], "error")
+        self.assertIn("bad_role", by_idx[0]["error"])
+        self.assertEqual(by_idx[1]["status"], "completed")
+        # Only the good-role task reached _build_child_agent
+        self.assertEqual(mock_build.call_count, 1)
+        good_kwargs = mock_build.call_args.kwargs
+        self.assertEqual(good_kwargs["model"], "claude-opus-4-7")
+        self.assertEqual(good_kwargs["override_provider"], "anthropic")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_role_model_beats_task_and_kwargs(
+        self, mock_resolve, mock_build, mock_run, _cfg,
+    ):
+        """Role-resolved model overrides both task.model and top-level model kwarg.
+
+        This pairs model with the role-resolved provider/base_url/api_key.
+        Letting task.model (an AI-authored tool kwarg) win would combine
+        role's provider with AI's model — a broken pairing that crashes at
+        API call time.
+        """
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-ant-***",
+            "api_mode": "anthropic_messages",
+        }
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        parent._delegation_mentions = {
+            "r1": {
+                "role_id": "r1",
+                "model": "claude-opus-4-7",  # role's authoritative choice
+                "provider_slug": "anthropic",
+            }
+        }
+        result = json.loads(delegate_task(
+            tasks=[{
+                "goal": "Do thing",
+                "context": "role_id: r1",
+                "model": "gpt-4o",  # AI's one-off; must be ignored
+            }],
+            model="llama-3-70b",  # top-level kwarg; must also be ignored
+            parent_agent=parent,
+        ))
+        self.assertEqual(result["results"][0]["status"], "completed")
+        kwargs = mock_build.call_args.kwargs
+        self.assertEqual(kwargs["model"], "claude-opus-4-7")
+        # And it's paired with the role-resolved provider
+        self.assertEqual(kwargs["override_provider"], "anthropic")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_role_acp_command_and_args_propagate(
+        self, mock_resolve, mock_build, mock_run, _cfg,
+    ):
+        """Role pointing at ACP provider threads command/args into override_acp_*."""
+        mock_resolve.return_value = {
+            "provider": "copilot-acp",
+            "base_url": "",
+            "api_key": "gh_pat_***",
+            "api_mode": "acp",
+            "command": "copilot-language-server",
+            "args": ["--acp"],
+        }
+        mock_build.return_value = MagicMock()
+        mock_run.return_value = {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 1.0,
+        }
+        parent = _make_mock_parent()
+        parent._delegation_mentions = {
+            "r1": {
+                "role_id": "r1",
+                "model": "gpt-4o",
+                "provider_slug": "copilot-acp",
+            }
+        }
+        result = json.loads(delegate_task(
+            goal="Do thing",
+            context="role_id: r1",
+            parent_agent=parent,
+        ))
+        self.assertEqual(result["results"][0]["status"], "completed")
+        kwargs = mock_build.call_args.kwargs
+        self.assertEqual(kwargs["override_acp_command"], "copilot-language-server")
+        self.assertEqual(kwargs["override_acp_args"], ["--acp"])
+
+
+class TestDesktopMentionsInjectionContract(unittest.TestCase):
+    """Source-level guard for the desktop.py::_run_agent_async lifecycle contract.
+
+    Phase 8 depends on the gateway injecting ``active.mentions`` onto
+    ``agent._delegation_mentions`` before ``run_conversation`` runs, and
+    clearing it in the ``finally`` block.  A full async integration test is
+    preferable but requires mocking the whole adapter; this cheap source
+    check catches the most likely regression — someone removing or moving
+    either line out of the correct block.
+    """
+
+    def test_assignment_and_finally_clear_both_present(self):
+        import pathlib
+        # Resolve relative to the repo root so the test is location-robust.
+        this_file = pathlib.Path(__file__).resolve()
+        repo_root = this_file.parents[2]
+        src = (repo_root / "gateway" / "platforms" / "desktop.py").read_text()
+        self.assertIn(
+            "active.agent._delegation_mentions = active.mentions or {}",
+            src,
+            "_run_agent_async must inject active.mentions onto the agent "
+            "before run_conversation (Phase 8 contract).",
+        )
+        self.assertIn(
+            "active.agent._delegation_mentions = None",
+            src,
+            "_run_agent_async finally block must clear _delegation_mentions "
+            "to prevent cross-turn leakage (Phase 8 contract).",
+        )
 
 
 if __name__ == "__main__":
