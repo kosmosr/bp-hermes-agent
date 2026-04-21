@@ -2404,6 +2404,23 @@ class DesktopAdapter(BasePlatformAdapter):
                     "total_models": len(proxy_models) if proxy_models else 1,
                     "source": "endpoint",
                 }]
+                # 也带上其他已认证 provider 的 model 候选,方便前端在 local/custom 模式下
+                # 切回别的 provider 时拿到推荐模型(不带的话 Settings > Model 里点「使用」
+                # 会错把当前 local 的 model id 带到新 provider)。
+                try:
+                    others = list_authenticated_providers(
+                        current_provider=current_provider,
+                        user_providers=cfg.get("providers"),
+                        max_models=20,
+                    )
+                    seen = {current_provider}
+                    for p in others:
+                        if p["slug"] in seen:
+                            continue
+                        seen.add(p["slug"])
+                        providers.append(p)
+                except Exception:
+                    logger.debug("[desktop] could not enumerate other authenticated providers in local mode")
             else:
                 providers = list_authenticated_providers(
                     current_provider=current_provider,

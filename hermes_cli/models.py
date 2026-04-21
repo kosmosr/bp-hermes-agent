@@ -244,12 +244,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "big-pickle",
     ],
     "opencode-go": [
+        "glm-5.1",
         "glm-5",
+        "kimi-k2.6",
         "kimi-k2.5",
         "mimo-v2-pro",
         "mimo-v2-omni",
         "minimax-m2.7",
         "minimax-m2.5",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
     ],
     "ai-gateway": [
         "anthropic/claude-opus-4.6",
