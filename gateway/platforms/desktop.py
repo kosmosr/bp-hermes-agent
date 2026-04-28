@@ -34,6 +34,7 @@ from aiohttp import web
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
+from hermes_session_id import clear_session_id, set_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -2034,14 +2035,27 @@ class DesktopAdapter(BasePlatformAdapter):
                 # can look up per-role {model, provider_slug} from PromptSendMsg
                 # and override the spawned child's runtime credentials.
                 active.agent._delegation_mentions = active.mentions or {}
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: active.agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=history,
-                        task_id=session_id,
-                    ),
-                )
+
+                # Phase 6: propagate session_id into the executor thread so
+                # tools.mcp_tool._make_tool_handler can inject it into
+                # _meta.session_id for hermes_fs.* MCP calls. set/clear must
+                # run INSIDE the executor target — ContextVar does not
+                # reliably cross run_in_executor (L1991-1992) and env vars
+                # would race across the up-to-max_conn concurrent turns
+                # the semaphore allows. clear in finally because the
+                # ThreadPoolExecutor reuses worker threads across turns.
+                def _run_with_session_id():
+                    set_session_id(session_id)
+                    try:
+                        return active.agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=history,
+                            task_id=session_id,
+                        )
+                    finally:
+                        clear_session_id()
+
+                result = await loop.run_in_executor(None, _run_with_session_id)
                 # Capture full message history for next turn
                 if result and isinstance(result, dict) and "messages" in result:
                     self._session_histories[session_id] = result["messages"]

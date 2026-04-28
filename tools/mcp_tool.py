@@ -82,6 +82,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from hermes_session_id import get_session_id
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1386,17 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
+
+        # Phase 6: inject session_id into _meta for hermes_fs.* tools.
+        # The agent's executor thread set this via thread-local in
+        # gateway.platforms.desktop._run_agent_async (this _handler runs
+        # on that same thread). Read & inject here in the sync segment,
+        # BEFORE _call() schedules onto _mcp_loop via
+        # run_coroutine_threadsafe — that boundary loses thread-local
+        # context, so reading inside _call would see the empty default.
+        sid = get_session_id()
+        if sid and tool_name.startswith("hermes_fs."):
+            args = {**args, "_meta": {"session_id": sid}}
 
         async def _call():
             result = await server.session.call_tool(tool_name, arguments=args)
