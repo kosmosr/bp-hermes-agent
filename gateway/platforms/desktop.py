@@ -40,6 +40,39 @@ logger = logging.getLogger(__name__)
 
 VERSION = "0.1.0"
 
+# Phase 6 Slice 5: injected into every turn's ephemeral system prompt so the
+# LLM translates hermes_fs error codes into user-friendly Chinese replies.
+_HERMES_FS_ERROR_GUIDE = """
+
+当 hermes_fs 文件工具返回错误时,请按以下规则向用户解释:
+- out_of_workspace → 路径超出工作目录范围,只能操作工作目录内的文件
+- catastrophic_workspace_root → 不允许对整个工作目录执行高风险操作,请用户手动确认或缩小范围
+- unc_not_supported → 暂不支持 Windows 网络共享路径(\\\\server\\share),请改用本机目录
+- path_too_long_app → 路径超过客户端限制,请缩短路径
+- path_too_long_os → 路径超过操作系统限制,Windows 可提示启用 LongPathsEnabled 或换短路径
+- invalid_path → 路径格式不正确,请检查是否为空或包含非法字符
+- invalid_filename → 文件名不合法,可能是 Windows 保留名或包含禁用字符
+- invalid_pattern → 搜索 glob 或正则表达式不合法,请修正搜索模式
+- not_found → 文件或目录不存在,检查路径是否正确
+- not_a_directory → 预期是目录但给了文件路径
+- is_a_directory → 预期是文件但给了目录路径
+- not_empty → 目录不为空,需要用户确认是否 recursive=true 删除
+- new_exists → 目标路径已存在,不能覆盖,请询问用户改名或覆盖策略
+- parent_not_found → 父目录不存在,需要先创建或用 create_parents=true
+- permission_denied → 没有权限访问该文件,可能需要调整权限
+- disk_full → 磁盘空间不足,写入失败
+- file_busy → 文件正在被其他程序占用,可建议关闭占用程序后重试
+- file_too_large → 文件太大,超出大小限制
+- not_text_file → 不是文本文件,试试用 read_media_file
+- search_timeout → 搜索超时,可能只有部分结果,可建议缩小范围
+- approval_denied → 用户拒绝了该操作
+- approval_timeout → 等待用户确认超时(30秒),可以建议用户重新发起请求
+- no_workspace → 还没有选择工作目录,请先选择一个文件夹
+- cross_device_dir → 源和目标不在同一磁盘分区,目录跨盘移动暂不支持
+- service_unavailable → 客户端文件服务暂时不可用,请稍后重试
+不要原样输出错误码,用自然语言告诉用户发生了什么、怎么解决。
+"""
+
 
 def check_desktop_requirements() -> bool:
     """Check if aiohttp is available."""
@@ -1855,6 +1888,12 @@ class DesktopAdapter(BasePlatformAdapter):
             active.mentions = {
                 m.get("role_id", ""): m for m in mentions if m.get("role_id")
             }
+
+        # Phase 6 Slice 5: hermes_fs error code guide for LLM.
+        # Appended to every turn so the LLM translates fs error codes
+        # into user-friendly Chinese replies instead of echoing raw codes.
+        ephemeral_prompt = (ephemeral_prompt or "") + _HERMES_FS_ERROR_GUIDE
+        ephemeral_prompt = ephemeral_prompt.strip() or None
 
         agent = self._create_agent_for_turn(
             session_id=session_id,
