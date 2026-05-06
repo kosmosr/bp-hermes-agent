@@ -274,6 +274,59 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_meta_session_id_injected_for_hermes_fs_server(self):
+        """Phase 6: hermes_fs server gets thread-local session_id into _meta."""
+        from tools.mcp_tool import _make_tool_handler, _servers
+        from hermes_session_id import set_session_id, clear_session_id
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("hermes_fs", session=mock_session)
+        _servers["hermes_fs"] = server
+
+        try:
+            set_session_id("sess-test-abc")
+            handler = _make_tool_handler("hermes_fs", "list", 120)
+            with self._patch_mcp_loop():
+                handler({"path": "/tmp"})
+            # Gate must match by server_name. tool_name here is the MCP
+            # server's internal short name ("list") — a previous startswith
+            # ("hermes_fs.") gate never matched and silently stripped sid.
+            mock_session.call_tool.assert_called_once_with(
+                "list",
+                arguments={"path": "/tmp", "_meta": {"session_id": "sess-test-abc"}},
+            )
+        finally:
+            clear_session_id()
+            _servers.pop("hermes_fs", None)
+
+    def test_meta_session_id_not_injected_for_other_servers(self):
+        """Other MCP servers must not see _meta.session_id (back-compat)."""
+        from tools.mcp_tool import _make_tool_handler, _servers
+        from hermes_session_id import set_session_id, clear_session_id
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("other_srv", session=mock_session)
+        _servers["other_srv"] = server
+
+        try:
+            set_session_id("sess-test-abc")
+            handler = _make_tool_handler("other_srv", "list", 120)
+            with self._patch_mcp_loop():
+                handler({"path": "/tmp"})
+            mock_session.call_tool.assert_called_once_with(
+                "list",
+                arguments={"path": "/tmp"},
+            )
+        finally:
+            clear_session_id()
+            _servers.pop("other_srv", None)
+
 
 class TestRunOnMCPLoopInterrupts:
     def test_interrupt_cancels_waiting_mcp_call(self):

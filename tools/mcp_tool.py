@@ -1387,15 +1387,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
-        # Phase 6: inject session_id into _meta for hermes_fs.* tools.
+        # Phase 6: inject session_id into _meta for the hermes_fs server
+        # so client-side mcp-fs-server can route by session.
         # The agent's executor thread set this via thread-local in
         # gateway.platforms.desktop._run_agent_async (this _handler runs
         # on that same thread). Read & inject here in the sync segment,
         # BEFORE _call() schedules onto _mcp_loop via
         # run_coroutine_threadsafe — that boundary loses thread-local
         # context, so reading inside _call would see the empty default.
+        # Match by server_name: tool_name here is the MCP-server-internal
+        # short name (e.g. "list", "read_text_file") — it never carries
+        # the "hermes_fs." prefix, so .startswith() would never match.
         sid = get_session_id()
-        if sid and tool_name.startswith("hermes_fs."):
+        if sid and server_name == "hermes_fs":
             args = {**args, "_meta": {"session_id": sid}}
 
         async def _call():
