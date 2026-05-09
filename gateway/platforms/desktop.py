@@ -2456,6 +2456,7 @@ class DesktopAdapter(BasePlatformAdapter):
                     "models": proxy_models if proxy_models else [current_model],
                     "total_models": len(proxy_models) if proxy_models else 1,
                     "source": "endpoint",
+                    "has_credentials": bool(api_key),
                 }]
                 # 也带上其他已认证 provider 的 model 候选,方便前端在 local/custom 模式下
                 # 切回别的 provider 时拿到推荐模型(不带的话 Settings > Model 里点「使用」
@@ -2487,6 +2488,10 @@ class DesktopAdapter(BasePlatformAdapter):
                 if not any(p["slug"] == current_provider for p in providers):
                     from hermes_cli.models import _PROVIDER_MODELS
                     from hermes_cli.providers import get_label
+                    logger.warning(
+                        "[desktop] no creds detected for current provider %s; emitting placeholder",
+                        current_provider,
+                    )
                     curated = list(_PROVIDER_MODELS.get(current_provider, []))
                     providers.insert(0, {
                         "slug": current_provider,
@@ -2496,7 +2501,15 @@ class DesktopAdapter(BasePlatformAdapter):
                         "models": curated[:20] if curated else [current_model],
                         "total_models": len(curated) if curated else 1,
                         "source": "fallback",
+                        "has_credentials": False,
                     })
+
+            # Entries from list_authenticated_providers all passed the
+            # has_creds check (env var / auth_store / credential_pool) — mark
+            # them True. The fallback placeholder above explicitly sets False
+            # so setdefault won't clobber it.
+            for _p in providers:
+                _p.setdefault("has_credentials", True)
 
             return {
                 "providers": providers,
