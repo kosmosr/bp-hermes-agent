@@ -261,10 +261,77 @@ def _try_resolve_from_custom_pool(
         return None
 
 
+def _lookup_custom_provider_by_base_url(
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Reverse-lookup custom_providers[] by model.base_url.
+
+    Compat path for callers that write model.provider="custom" (bare, no slug
+    suffix) plus model.base_url=<url> — e.g., older hermes-desktop where the
+    EndpointCard "use" handler hardcoded provider_slug to "custom". Without
+    this, _get_named_custom_provider short-circuits on bare "custom" and
+    api_key from custom_providers[] is never reached at runtime.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return None
+    if not isinstance(config, dict):
+        return None
+    model_cfg = config.get("model")
+    if not isinstance(model_cfg, dict):
+        return None
+    cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    if not cfg_base_url:
+        return None
+
+    custom_providers = get_compatible_custom_providers(config)
+    if not isinstance(custom_providers, list) or not custom_providers:
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_base_url = str(entry.get("base_url", "") or "").strip().rstrip("/")
+        if entry_base_url != cfg_base_url:
+            continue
+        result: Dict[str, Any] = {
+            "name": str(entry.get("name", "") or "").strip(),
+            "base_url": entry_base_url,
+            "api_key": str(entry.get("api_key", "") or "").strip(),
+        }
+        key_env = str(entry.get("key_env", "") or "").strip()
+        if key_env:
+            if not result["api_key"]:
+                env_key = os.getenv(key_env, "").strip()
+                if env_key:
+                    result["api_key"] = env_key
+            result["key_env"] = key_env
+        provider_key = str(entry.get("provider_key", "") or "").strip()
+        if provider_key:
+            result["provider_key"] = provider_key
+        api_mode = _parse_api_mode(entry.get("api_mode"))
+        if api_mode:
+            result["api_mode"] = api_mode
+        model_name = str(entry.get("model", "") or entry.get("default_model", "") or "").strip()
+        if model_name:
+            result["model"] = model_name
+        return result
+
+    return None
+
+
 def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
-    if not requested_norm or requested_norm == "custom":
+    if not requested_norm:
         return None
+
+    # Bare "custom" (no slug) → reverse-lookup via model.base_url so legacy
+    # clients still resolve api_key from custom_providers[]. Explicit
+    # "custom:<slug>" walks the normal lookup path below.
+    if requested_norm == "custom":
+        return _lookup_custom_provider_by_base_url()
 
     # Raw names should only map to custom providers when they are not already
     # valid built-in providers or aliases. Explicit menu keys like

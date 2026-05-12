@@ -1242,8 +1242,12 @@ class DesktopAdapter(BasePlatformAdapter):
             # Detect custom/local provider — these use a single endpoint
             # that serves multiple models, so switching should only change
             # the model name, NOT the provider/credentials.
+            # "custom:<slug>" form (e.g. "custom:ikuncode" written by
+            # hermes-desktop EndpointCard) is normalised back to "custom"
+            # so it matches the local-provider set.
             _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
-            is_local = cfg_provider in _LOCAL_PROVIDERS
+            cfg_provider_root = cfg_provider.split(":", 1)[0] if cfg_provider else ""
+            is_local = cfg_provider_root in _LOCAL_PROVIDERS
 
             if is_local:
                 # For custom providers: just update the model name, keep
