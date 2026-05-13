@@ -34,6 +34,7 @@ from aiohttp import web
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
+from hermes_cli.config import get_config_path, get_env_path, get_hermes_home
 from hermes_session_id import clear_session_id, set_session_id
 
 logger = logging.getLogger(__name__)
@@ -2428,7 +2429,7 @@ class DesktopAdapter(BasePlatformAdapter):
             from gateway.run import _load_gateway_config, _resolve_gateway_model
 
             # Reload .env so freshly-written credentials are visible
-            _env_path = Path.home() / ".hermes" / ".env"
+            _env_path = get_env_path()
             if _env_path.exists():
                 from dotenv import load_dotenv
                 try:
@@ -2533,9 +2534,9 @@ class DesktopAdapter(BasePlatformAdapter):
         """Return full config snapshot: default model, provider credentials, custom endpoints."""
         from dotenv import dotenv_values
 
-        hermes_dir = Path.home() / ".hermes"
-        config_path = hermes_dir / "config.yaml"
-        env_path = hermes_dir / ".env"
+        hermes_dir = get_hermes_home()
+        config_path = get_config_path()
+        env_path = get_env_path()
 
         try:
             config: dict = {}
@@ -2671,7 +2672,7 @@ class DesktopAdapter(BasePlatformAdapter):
                             message="model_id and provider_slug are required")
             return
 
-        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
         import yaml
@@ -2784,7 +2785,7 @@ class DesktopAdapter(BasePlatformAdapter):
                             message="API Key 格式无效")
             return
 
-        env_path = Path.home() / ".hermes" / ".env"
+        env_path = get_env_path()
         env_path.parent.mkdir(parents=True, exist_ok=True)
         if not env_path.exists():
             env_path.touch()
@@ -2835,7 +2836,7 @@ class DesktopAdapter(BasePlatformAdapter):
                             message="请输入有效的 HTTP(S) URL")
             return
 
-        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
         import yaml
@@ -2898,7 +2899,7 @@ class DesktopAdapter(BasePlatformAdapter):
                             message="slug is required")
             return
 
-        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path = get_config_path()
         if not config_path.exists():
             await conn.send("config.error", ref_id=msg.get("id"),
                             action="delete-endpoint",
@@ -2993,7 +2994,7 @@ class DesktopAdapter(BasePlatformAdapter):
                                 message=f"Malformed key: {dot_key}")
                 return
 
-        config_path = Path.home() / ".hermes" / "config.yaml"
+        config_path = get_config_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
         import yaml
