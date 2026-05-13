@@ -2445,23 +2445,68 @@ class DesktopAdapter(BasePlatformAdapter):
             current_model = _resolve_gateway_model(cfg)
 
             _LOCAL_PROVIDERS = {"custom", "lmstudio", "ollama", "vllm", "llamacpp"}
-            if current_provider in _LOCAL_PROVIDERS:
+            # Root-split so "custom:<slug>" form (written by hermes-desktop
+            # EndpointCard) also matches the local-provider set. Mirrors the
+            # same handling in _handle_model_switch — both code paths must
+            # agree, otherwise welcome/refresh sends a fallback placeholder
+            # with has_credentials=false while runtime resolves through the
+            # custom-endpoint api_key, and the client filters the provider
+            # out of the model dropdown.
+            current_provider_root = current_provider.split(":", 1)[0] if current_provider else ""
+            if current_provider_root in _LOCAL_PROVIDERS:
                 base_url = (model_cfg.get("base_url", "") if isinstance(model_cfg, dict) else "")
                 api_key = (model_cfg.get("api_key", "") if isinstance(model_cfg, dict) else "")
+                # For "custom:<slug>" form, prefer the matching entry in
+                # custom_providers[] (where setEndpoint writes api_key). The
+                # top-level model.{base_url,api_key} can be stale or empty.
+                custom_slug = ""
+                if current_provider.startswith("custom:") and ":" in current_provider:
+                    custom_slug = current_provider.split(":", 1)[1]
+                    for cp in (cfg.get("custom_providers") or []):
+                        if not isinstance(cp, dict):
+                            continue
+                        # Match either an explicit slug field (newer entries)
+                        # or _slugify(name) (older entries written before the
+                        # slug field was persisted).
+                        cp_slug = cp.get("slug") or self._slugify(cp.get("name", ""))
+                        if cp_slug == custom_slug:
+                            if not base_url:
+                                base_url = cp.get("base_url", "") or ""
+                            if not api_key:
+                                api_key = cp.get("api_key", "") or ""
+                            break
                 if not api_key:
                     api_key = (os.environ.get("OPENAI_API_KEY")
                                or os.environ.get("ANTHROPIC_API_KEY")
                                or os.environ.get("API_KEY") or "")
                 proxy_models = await self._fetch_endpoint_models(base_url, api_key)
+                # Pick a display name: custom_providers[].name for custom:<slug>,
+                # title-cased provider for the bare aliases (ollama, lmstudio…).
+                provider_display_name = current_provider.title()
+                if custom_slug:
+                    for cp in (cfg.get("custom_providers") or []):
+                        if not isinstance(cp, dict):
+                            continue
+                        cp_slug = cp.get("slug") or self._slugify(cp.get("name", ""))
+                        if cp_slug == custom_slug:
+                            provider_display_name = cp.get("name") or custom_slug or provider_display_name
+                            break
                 providers = [{
                     "slug": current_provider,
-                    "name": current_provider.title(),
+                    "name": provider_display_name,
                     "is_current": True,
                     "is_user_defined": True,
                     "models": proxy_models if proxy_models else [current_model],
                     "total_models": len(proxy_models) if proxy_models else 1,
                     "source": "endpoint",
-                    "has_credentials": bool(api_key),
+                    # Treat the entry as credentialed when *either* we got
+                    # a model list back from /v1/models (network proof the
+                    # endpoint is reachable & authenticated) *or* the user
+                    # explicitly registered this custom_providers[] slug
+                    # (local LLMs commonly have no api_key but are still
+                    # valid). Bare "custom" without a slug falls back to
+                    # bool(api_key) like before.
+                    "has_credentials": bool(api_key) or bool(custom_slug) or bool(proxy_models),
                 }]
                 # 也带上其他已认证 provider 的 model 候选,方便前端在 local/custom 模式下
                 # 切回别的 provider 时拿到推荐模型(不带的话 Settings > Model 里点「使用」
@@ -2851,6 +2896,7 @@ class DesktopAdapter(BasePlatformAdapter):
                         config["custom_providers"] = []
 
                     entry = {
+                        "slug": slug or self._slugify(name),
                         "name": name,
                         "base_url": base_url,
                         "default_model": msg.get("default_model", ""),
@@ -2888,6 +2934,13 @@ class DesktopAdapter(BasePlatformAdapter):
         await conn.send("config.ok", ref_id=msg.get("id"),
                          action="set-endpoint")
         logger.info("[desktop] config.set-endpoint → %s (%s)", name, base_url)
+
+        # Re-emit models snapshot so a freshly-saved endpoint immediately
+        # reflects in the ModelSelector dropdown (without it the client has
+        # to wait for the next reconnect for welcome to refresh).
+        models_payload = await self._build_models_payload()
+        if models_payload:
+            await conn.send("models.refresh", **models_payload)
 
     async def _handle_config_delete_endpoint(self, conn: _Connection, msg: dict) -> None:
         """Remove a custom endpoint from config.yaml."""
