@@ -110,7 +110,10 @@ all = [
   "hermes-agent[voice]",
   "hermes-agent[dingtalk]",
   "hermes-agent[feishu]",
-  "hermes-agent[mistral]",
+  # mistral: 2026-05-13 上游 [all] 解析时 mistralai 传递依赖跟其他 extra 冲突
+  # (uv 报 "no versions of mistralai" 实际是 dep solver 失败)。需要的人单独
+  # 装 `hermes-agent[mistral]`,base 镜像先剥离。等上游升完再 revert。
+  # "hermes-agent[mistral]",
   "hermes-agent[bedrock]",
   "hermes-agent[web]",
 ]
