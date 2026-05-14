@@ -1952,6 +1952,13 @@ class DesktopAdapter(BasePlatformAdapter):
         # the desktop UI with empty 思考过程 blocks. Reads agent.reasoning_effort
         # from config.yaml each turn so UI changes via config.update apply live.
         reasoning_config = GatewayRunner._load_reasoning_config()
+        # Desktop default-on policy: 沸点 产品定位"开箱体验 AI 思考",空 effort →
+        # parse_reasoning_effort()=None → 默认禁用 thinking,是 CLI 时代的行为继承。
+        # 桌面端覆盖此默认:None → medium(只覆盖未设值,用户显式 "none" 仍走
+        # {"enabled": False} 关闭分支)。这样老 PVC 上 seed 早于 reasoning_effort
+        # 字段引入的用户也能立刻体验思考过程,无需手动改 config.yaml。
+        if reasoning_config is None:
+            reasoning_config = {"enabled": True, "effort": "medium"}
         service_tier = GatewayRunner._load_service_tier()
         session_override = self._session_model_overrides.get(session_id, {})
 
