@@ -1946,6 +1946,13 @@ class DesktopAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         user_config = _load_gateway_config()
+        # Mirror GatewayRunner.run_agent paths (gateway/run.py:5739/5907/8527):
+        # without reasoning_config, anthropic_adapter._build_api_kwargs skips the
+        # `thinking` kwarg and the model never streams reasoning tokens, leaving
+        # the desktop UI with empty 思考过程 blocks. Reads agent.reasoning_effort
+        # from config.yaml each turn so UI changes via config.update apply live.
+        reasoning_config = GatewayRunner._load_reasoning_config()
+        service_tier = GatewayRunner._load_service_tier()
         session_override = self._session_model_overrides.get(session_id, {})
 
         if model_override:
@@ -2014,6 +2021,8 @@ class DesktopAdapter(BasePlatformAdapter):
             reasoning_callback=reasoning_callback,
             clarify_callback=clarify_callback,
             step_callback=step_callback,
+            reasoning_config=reasoning_config,
+            service_tier=service_tier,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
