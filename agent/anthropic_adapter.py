@@ -1398,6 +1398,14 @@ def build_anthropic_kwargs(
     # MiniMax Anthropic-compat endpoints support thinking (manual mode only,
     # not adaptive).  Haiku does NOT support extended thinking — skip entirely.
     #
+    # 2026-05-15 update: empirically ikun (cn anthropic-compat proxy) and other
+    # 3rd-party endpoints silently DROP thinking_delta SSE events in stream
+    # mode when type=adaptive (non-stream non-stream response IS correct, only
+    # stream is broken). Force 3rd-party endpoints onto manual `type: enabled`
+    # mode unconditionally — they all advertise manual-mode thinking support
+    # and the stream path emits proper thinking_delta blocks. Direct
+    # anthropic.com keeps adaptive for the better effort handling.
+    #
     # On 4.7+ the `thinking.display` field defaults to "omitted", which
     # silently hides reasoning text that Hermes surfaces in its CLI. We
     # request "summarized" so the reasoning blocks stay populated — matching
@@ -1406,7 +1414,8 @@ def build_anthropic_kwargs(
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
-            if _supports_adaptive_thinking(model):
+            _force_manual = _is_third_party_anthropic_endpoint(base_url)
+            if _supports_adaptive_thinking(model) and not _force_manual:
                 kwargs["thinking"] = {
                     "type": "adaptive",
                     "display": "summarized",
